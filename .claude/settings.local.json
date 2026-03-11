@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:help.openai.com)",
+      "WebFetch(domain:docs.unsloth.ai)",
+      "WebFetch(domain:unsloth.ai)",
+      "Bash(python3 src/training/prepare_dataset.py)",
+      "Bash(.venv/bin/uv pip:*)",
+      "Bash(git status:*)"
+    ]
+  }
+}

@@ -28,6 +28,13 @@ logs/
 *.csv
 *.jsonl
 
+# Unsloth compiled cache
+unsloth_compiled_cache/
+
+# Training outputs (checkpoints, adapter weights, etc.)
+training/lora/
+training/outputs/
+
 # Editor / OS
 .vscode/
 .idea/
