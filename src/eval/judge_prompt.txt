@@ -1,0 +1,70 @@
+You are evaluating transcription cleanup quality. You will see a raw dictated
+transcript, a gold-standard reference, and two model outputs (A and B) in
+random order. Score each output independently against the reference.
+
+CONTEXT:
+- The speaker is a non-native English speaker (French) who dictates to coding
+  assistants (Claude Code, Codex). Transcripts should be cleaned for input to
+  these tools.
+- Custom vocabulary: Alien, brake, brake point, chicane, Claude, Claude Code,
+  cron, cue, Electron, GT Coach, json, OpenClaw, prompt, supabase, unsloth,
+  VoiceInk.
+
+RUBRIC (score each dimension 1-5 for each output):
+
+1. MEANING_PRESERVATION (weight: 3x) -- Critical
+   5 = Perfect meaning preservation, no additions or omissions
+   4 = Trivially different phrasing, no meaning change
+   3 = Minor meaning shift (dropped qualifier, softened assertion)
+   2 = Noticeable meaning change (dropped clause, changed opinion)
+   1 = Major meaning distortion or hallucinated content
+
+2. FILLER_REMOVAL (weight: 2x)
+   5 = All fillers removed, no meaningful content lost
+   4 = Most fillers removed, minor miss
+   3 = Some fillers remain or one meaningful word incorrectly removed
+   2 = Many fillers remain or multiple meaningful words dropped
+   1 = No cleanup or aggressive meaning-altering removal
+
+3. GRAMMAR_FLUENCY (weight: 2x)
+   5 = Native-level grammar, natural flow
+   4 = Minor imperfection that doesn't affect clarity
+   3 = Noticeable grammar issue (wrong article, awkward phrasing)
+   2 = Multiple grammar errors
+   1 = Broken grammar, hard to read
+
+4. TECHNICAL_ACCURACY (weight: 2x)
+   5 = All technical terms, names, numbers correct
+   4 = One minor miss (e.g., casing)
+   3 = One substantive error (wrong term spelling)
+   2 = Multiple errors in technical content
+   1 = Systematic technical term errors
+
+5. CONCISENESS (weight: 1x)
+   5 = Optimally concise, nothing unnecessary remains
+   4 = Nearly optimal, one minor redundancy
+   3 = Some verbal fluff remains
+   2 = Substantial unnecessary content
+   1 = No cleanup of verbosity
+
+6. INSTRUCTION_FOLLOWING (weight: 3x) -- Critical
+   5 = Perfect role adherence, clean output only
+   4 = Trivial format issue (extra whitespace, quotes)
+   3 = Minor role break (added a brief note)
+   2 = Partial role break (answered part of a question)
+   1 = Complete role failure (answered the question, added commentary)
+
+RAW TRANSCRIPT:
+{raw_transcript}
+
+GOLD-STANDARD REFERENCE:
+{gold_label}
+
+OUTPUT A:
+{output_a}
+
+OUTPUT B:
+{output_b}
+
+Respond with ONLY a JSON object, no other text:
+{{"output_a": {{"meaning_preservation": <1-5>, "filler_removal": <1-5>, "grammar_fluency": <1-5>, "technical_accuracy": <1-5>, "conciseness": <1-5>, "instruction_following": <1-5>, "notes": "<one sentence>"}}, "output_b": {{"meaning_preservation": <1-5>, "filler_removal": <1-5>, "grammar_fluency": <1-5>, "technical_accuracy": <1-5>, "conciseness": <1-5>, "instruction_following": <1-5>, "notes": "<one sentence>"}}}}

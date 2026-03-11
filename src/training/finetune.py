@@ -90,6 +90,7 @@ def main() -> None:
     print(f"Loading base model: {args.base_model}")
     model, tokenizer = FastVisionModel.from_pretrained(
         args.base_model,
+        max_seq_length=args.max_seq_length,
         load_in_4bit=args.load_in_4bit,
         use_gradient_checkpointing="unsloth",
     )
@@ -181,15 +182,17 @@ def main() -> None:
     # ---- Export to GGUF ----
     if args.export_gguf is not None:
         quant_methods = args.export_gguf if args.export_gguf else ["q4_k_m"]
-        gguf_dir = DEFAULT_GGUF_DIR / "Qwen3.5-2B-voiceink-GGUF"
-        gguf_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\nExporting to GGUF ({', '.join(quant_methods)}) -> {gguf_dir}")
+        # Unsloth appends "_gguf" to the path, so we use a base name
+        # that produces the final directory we want.
+        gguf_base = DEFAULT_GGUF_DIR / "Qwen3.5-2B-voiceink"
+        gguf_final = Path(str(gguf_base) + "_gguf")
+        print(f"\nExporting to GGUF ({', '.join(quant_methods)}) -> {gguf_final}")
         model.save_pretrained_gguf(
-            str(gguf_dir),
+            str(gguf_base),
             tokenizer,
             quantization_method=quant_methods,
         )
-        print(f"GGUF export complete: {gguf_dir}")
+        print(f"GGUF export complete: {gguf_final}")
 
     print("\nDone!")
 
