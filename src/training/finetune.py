@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     # Model
     p.add_argument("--base-model", default="unsloth/Qwen3.5-2B",
                    help="Base model to fine-tune")
-    p.add_argument("--max-seq-length", type=int, default=8192,
+    p.add_argument("--max-seq-length", type=int, default=16384,
                    help="Max sequence length for training")
     p.add_argument("--load-in-4bit", action="store_true",
                    help="Load base model in 4bit (saves VRAM, slightly lower quality)")

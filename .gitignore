@@ -35,6 +35,10 @@ unsloth_compiled_cache/
 training/lora/
 training/outputs/
 
+# Unsloth merged/exported model artifacts
+models/Qwen3.5-2B-voiceink-GGUF/
+models/Qwen3.5-2B-voiceink-GGUF_gguf/
+
 # Editor / OS
 .vscode/
 .idea/

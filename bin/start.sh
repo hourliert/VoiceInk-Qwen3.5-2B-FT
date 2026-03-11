@@ -25,7 +25,7 @@ trap cleanup EXIT INT TERM
   --host "${LLAMA_HOST}" \
   --port "${LLAMA_PORT}" \
   --parallel 1 \
-  --ctx-size 32768 \
+  --ctx-size 16384 \
   --flash-attn on \
   --jinja \
   --metrics \
