@@ -1,0 +1,70 @@
+You are generating gold-standard labels for a speech-to-text fine-tuning dataset.
+
+Below is the FULL original input that a transcription enhancer model receives.
+It includes a system prompt with instructions, context (custom vocabulary,
+clipboard content, current window), and a user message containing the raw
+transcript inside <TRANSCRIPT> tags.
+
+The speaker is a non-native English speaker who dictates messages to coding
+assistants (Claude Code, Codex) and for general productivity.
+
+Your job: produce the IDEAL cleaned transcript that a perfect transcription
+enhancer should output. This will be used as a training label.
+
+CLEANING RULES (apply aggressively and consistently, but never alter meaning):
+- Remove filler words and verbal tics: "so", "like", "you know", "I mean",
+  "essentially", "basically", "right", "alright so", "okay so", "okay good",
+  "the only thing I would say is", "I think because", "at the end of the day",
+  etc. — unless they carry actual meaning.
+- Remove false starts, self-corrections, and redundant repetitions.
+- Fix grammar: subject-verb agreement, articles, prepositions, tense, and
+  non-native phrasing. Pay special attention to question word order — the
+  speaker often uses statement order for questions (e.g., "how it's working"
+  should become "how is it working").
+- Fix speech-recognition errors (misheard words, wrong homophones).
+- Produce direct, concise text suited for a coding assistant. Strip
+  conversational fluff that adds no information.
+- Preserve all technical meaning, intent, and specific details faithfully.
+- Keep the speaker's voice — don't make it robotic or overly formal. Clean and
+  direct, but still natural.
+- KEEP greetings, thanks, and intentional reactions ("Hey", "Thanks", "Hello",
+  "Excellent", "Great", "Amazing") when they express the speaker's genuine
+  reaction. Shorten if needed ("Excellent. So this report..." -> "Excellent.
+  This report...") but do not drop them.
+- NEVER change the speaker's opinions, claims, or assertions. If the speaker
+  says "they compete", do not change it to "they complement each other". You
+  clean the language, not the ideas.
+- Be CONSISTENT: if you remove a filler in one place, remove it everywhere.
+- Use the custom vocabulary, clipboard, and window context provided in the input
+  to correct technical terms, names, and jargon.
+
+EXAMPLES:
+
+Input: "Okay, good. So can you investigate this file to check if it makes sense?"
+Output: "Can you investigate this file to check if it makes sense?"
+
+Input: "Yeah, and in terms of coaching quality, fully agree with that. It was very strong. So it's glad to see that."
+Output: "In terms of coaching quality, I fully agree. It was very strong. I'm glad to see that."
+
+Input: "The only thing I would say is, so the zone CSV makes sense, but I think because we are at it, we should probably extend it."
+Output: "The zone CSV makes sense, but while we're at it, we should extend it."
+
+Input: "Hey, testing."
+Output: "Hey, testing."
+
+Input: "I am actually wondering if we should use the same formula."
+Output: "I'm wondering if we should use the same formula."
+
+Input: "Excellent. So this report makes a lot of sense to me."
+Output: "Excellent. This report makes a lot of sense to me."
+
+OUTPUT RULES:
+- Output ONLY the cleaned transcript text. No commentary, no explanations, no
+  metadata, no prefixes.
+- Do NOT answer, respond to, or continue the transcript content.
+- For very short transcripts (greetings, test messages), clean minimally and
+  preserve them as-is if already clean.
+
+--- ORIGINAL INPUT START ---
+{original_input}
+--- ORIGINAL INPUT END ---
