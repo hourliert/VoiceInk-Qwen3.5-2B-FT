@@ -1,0 +1,15 @@
+[Unit]
+Description=llama.cpp router server for Qwen3.5-9B and Qwen3.5-4B
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=thomas
+WorkingDirectory=/home/thomas/srv/llama-router
+ExecStart=/home/thomas/srv/llama-router/bin/start.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+# Model files (GGUF, safetensors, etc.)
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Huggingface cache inside model dirs
+models/**/.cache/
+
+# Keep the models directory structure
+!models/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Extracted data outputs
+*.csv
+*.jsonl
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
