@@ -145,6 +145,7 @@ def call_claude(prompt: str, model: str) -> str:
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     result = subprocess.run(
         ["claude", "-p", prompt, "--model", model,
+         "--max-tokens", "1024",
          "--disable-slash-commands", "--allowed-tools", ""],
         capture_output=True, text=True, timeout=600, env=env,
     )
@@ -419,16 +420,33 @@ def main() -> None:
         samples = samples[:args.limit]
     print(f"Loaded {len(samples)} eval samples")
 
-    # Generate model outputs
+    # Warm up + generate for each model (warmup forces model load so first
+    # timed sample isn't biased by cold-load latency)
+    warmup_msgs = [{"role": "user", "content": "Hello"}]
+
+    print(f"Warming up {args.baseline}...", end=" ", flush=True)
+    try:
+        _, ms = query_llama(warmup_msgs, args.baseline, args.llama_host, args.llama_port)
+        print(f"{ms:.0f}ms (discarded)")
+    except Exception as exc:
+        print(f"WARNING: warmup failed: {exc}")
+
     print(f"\nGenerating baseline outputs ({args.baseline})...")
     baseline_outputs = generate_outputs(samples, args.baseline, args.llama_host, args.llama_port)
+
+    print(f"\nWarming up {args.candidate}...", end=" ", flush=True)
+    try:
+        _, ms = query_llama(warmup_msgs, args.candidate, args.llama_host, args.llama_port)
+        print(f"{ms:.0f}ms (discarded)")
+    except Exception as exc:
+        print(f"WARNING: warmup failed: {exc}")
 
     print(f"\nGenerating candidate outputs ({args.candidate})...")
     candidate_outputs = generate_outputs(samples, args.candidate, args.llama_host, args.llama_port)
 
-    # Judge each pair
+    # Judge each pair — track results by index so we can filter consistently
     print(f"\nJudging outputs ({args.judge_model})...")
-    judgments = []
+    judge_results = {}  # index -> judgment dict (None for failures)
     errors = 0
 
     if args.parallel <= 1 or args.dry_run:
@@ -438,9 +456,8 @@ def main() -> None:
             print(f"  [{i+1}/{len(samples)}]", end=" ")
             result = judge_one(sample, b_out["text"], c_out["text"],
                               args.judge_model, args.dry_run, i)
-            if result:
-                judgments.append(result)
-            else:
+            judge_results[i] = result
+            if not result:
                 errors += 1
     else:
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
@@ -452,39 +469,47 @@ def main() -> None:
                                   args.judge_model, False, i)
                 futures[fut] = i
 
+            done_count = 0
             for fut in as_completed(futures):
                 i = futures[fut]
-                print(f"  [{len(judgments) + errors + 1}/{len(samples)}] Judged sample {i}")
+                done_count += 1
+                print(f"  [{done_count}/{len(samples)}] Judged sample {i}")
                 try:
                     result = fut.result()
                 except Exception as exc:
                     print(f"  ERROR: {exc}", file=sys.stderr)
-                    errors += 1
-                    continue
-                if result:
-                    judgments.append(result)
-                else:
+                    result = None
+                judge_results[i] = result
+                if not result:
                     errors += 1
 
     if args.dry_run:
         print("\nDry run complete.")
         return
 
-    if not judgments:
+    # Filter to only samples with successful judgments (keeps indices aligned)
+    good_indices = sorted(i for i, j in judge_results.items() if j is not None)
+
+    if not good_indices:
         print("No successful judgments.", file=sys.stderr)
         sys.exit(1)
 
     if errors:
         print(f"\n{errors} samples failed (excluded from results)")
 
+    filtered_samples = [samples[i] for i in good_indices]
+    filtered_baseline = [baseline_outputs[i] for i in good_indices]
+    filtered_candidate = [candidate_outputs[i] for i in good_indices]
+    filtered_judgments = [judge_results[i] for i in good_indices]
+
     # Aggregate and print
-    summary = aggregate(judgments, baseline_outputs, candidate_outputs,
+    summary = aggregate(filtered_judgments, filtered_baseline, filtered_candidate,
                         args.baseline, args.candidate)
     print_summary(summary)
 
     # Write results
-    write_results(args.output_dir, samples, baseline_outputs,
-                  candidate_outputs, judgments, summary)
+    write_results(args.output_dir, filtered_samples, filtered_baseline,
+                  filtered_candidate, filtered_judgments, summary)
 
 
 if __name__ == "__main__":
