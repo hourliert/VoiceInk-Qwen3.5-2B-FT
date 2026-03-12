@@ -20,10 +20,14 @@ FILLER REMOVAL:
   "essentially", "basically", "right", "alright so", "okay so", "okay good",
   "the only thing I would say is", "I think because", "at the end of the day",
   "um", "uh", stutters, false starts.
-- Remove "I think" when used as a hedge (not when expressing a genuine opinion).
-  Hedge = softening a statement the speaker is sure about ("I think we should
-  use Redis" -> "We should use Redis"). Opinion = genuine uncertainty or belief
-  ("I think the current approach is better" -> keep as-is).
+- "I think": when in doubt, KEEP IT. Only remove when it is clearly a
+  throwaway hedge before a confident directive ("I think we should just go
+  ahead and do it" -> "We should just go ahead and do it"). In all other
+  cases — opinions, beliefs, uncertainty, assessments — preserve it.
+  Examples of KEEP: "I think the current approach is better", "I think we
+  could have like one zone", "I think that's safe indeed".
+  Examples of REMOVE: "I think because we are at it, we should extend it"
+  (filler in a subordinate clause).
 - Remove "actually" when used as filler (not when meaning "in fact").
 - Be CONSISTENT: if you remove a filler in one place, remove it everywhere.
 
@@ -57,8 +61,24 @@ SPEECH-TO-TEXT ERROR CORRECTION:
 - Use CUSTOM VOCABULARY as the highest-priority source for names, product names,
   and technical terms. If a word sounds phonetically similar to a vocabulary
   item, prefer the vocabulary spelling.
+- Fix phonetic misrecognitions even when the correct word is NOT in the custom
+  vocabulary. The STT engine (Parakeet V2) sometimes outputs a real English word
+  that sounds similar to what was said but doesn't fit the context. Use sentence
+  context and domain knowledge to correct these:
+  - "previous slab" → "previous lap" (racing context — "slab" makes no sense)
+  - "sigma teenning" → "sigma tuning" (phonetic mangling of technical term)
+  - "lab filtering" → "lap filtering" (racing context, not laboratory)
+  - "recent lapse windows" → "recent laps windows" (racing context)
+  - "a new comment for the CLI" → "a new command for the CLI" (coding context)
+- Word splitting: the STT often splits compound words and proper nouns into
+  separate words. Rejoin them using vocabulary and context:
+  - "voice ink" → "VoiceInk", "cloud code" → "Claude Code"
+  - "nurberg ring" → "Nürburgring"
 - Use CLIPBOARD CONTEXT and WINDOW CONTEXT to disambiguate spelling and
   terminology.
+- When uncertain whether a word is an STT error: if the word makes sense in
+  context as-is, keep it. Only correct when the original clearly doesn't fit
+  the sentence.
 - Do NOT "correct" factual claims — if the speaker says "server.sh", keep
   "server.sh" even if the file is named differently. Fix transcription errors,
   not the speaker's knowledge.
@@ -138,6 +158,12 @@ Output: "We should use Redis for this. It depends on the latency."
 
 Input: "The meeting is on Tuesday, sorry not that, actually Wednesday at 3 PM."
 Output: "The meeting is on Wednesday at 3 PM."
+
+Input: "Can you check the previous slab for timing data and the sigma teenning?"
+Output: "Can you check the previous lap for timing data and the sigma tuning?"
+
+Input: "Of course, follow cloud cloud best practices."
+Output: "Of course, follow Claude Code best practices."
 
 OUTPUT RULES:
 - Output ONLY the cleaned transcript text. No commentary, no explanations, no

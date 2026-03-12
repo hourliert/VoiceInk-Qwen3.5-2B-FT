@@ -52,9 +52,9 @@ def parse_args() -> argparse.Namespace:
 
     # Training
     p.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
-    p.add_argument("--batch-size", type=int, default=2, help="Per-device batch size")
-    p.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps")
-    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    p.add_argument("--batch-size", type=int, default=1, help="Per-device batch size")
+    p.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps")
+    p.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     p.add_argument("--warmup-steps", type=int, default=10, help="Warmup steps")
     p.add_argument("--max-steps", type=int, default=-1,
                    help="Max training steps (-1 = use epochs)")
@@ -168,7 +168,12 @@ def main() -> None:
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
-        data_collator=UnslothVisionDataCollator(model, tokenizer),
+        data_collator=UnslothVisionDataCollator(
+            model, tokenizer,
+            train_on_responses_only=True,
+            instruction_part="<|im_start|>user\n",
+            response_part="<|im_start|>assistant\n",
+        ),
         train_dataset=train_data,
         eval_dataset=eval_data,
         args=SFTConfig(
@@ -178,10 +183,10 @@ def main() -> None:
             num_train_epochs=args.epochs,
             max_steps=args.max_steps if args.max_steps > 0 else -1,
             learning_rate=args.lr,
-            logging_steps=1,
+            logging_steps=10,
             optim="adamw_8bit",
-            weight_decay=0.001,
-            lr_scheduler_type="linear",
+            weight_decay=0.01,
+            lr_scheduler_type="cosine",
             seed=3407,
             output_dir=str(args.output_dir),
             report_to="none",
