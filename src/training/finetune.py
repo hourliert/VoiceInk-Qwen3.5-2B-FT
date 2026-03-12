@@ -16,8 +16,11 @@ Usage:
     python3 src/training/finetune.py --epochs 3 --lr 2e-4 --r 16
 """
 import argparse
+import filecmp
 import json
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,6 +68,36 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def snapshot_labeled_data() -> str | None:
+    """Snapshot datasets/labeled.jsonl if it changed since the last snapshot.
+
+    Returns the snapshot filename used (existing or new), or None if
+    labeled.jsonl doesn't exist.
+    """
+    labeled = ROOT / "datasets" / "labeled.jsonl"
+    if not labeled.exists():
+        return None
+
+    # Count samples
+    n_samples = sum(1 for line in labeled.open() if line.strip())
+
+    # Find most recent existing snapshot
+    snapshots = sorted(ROOT.glob("datasets/labeled.*.jsonl"))
+    if snapshots:
+        latest = snapshots[-1]
+        if filecmp.cmp(labeled, latest, shallow=False):
+            print(f"Dataset snapshot unchanged: {latest.name}")
+            return latest.name
+
+    # Create new snapshot
+    date_str = datetime.now().strftime("%Y%m%d")
+    name = f"labeled.{date_str}.{n_samples}samples.jsonl"
+    dest = ROOT / "datasets" / name
+    shutil.copy2(labeled, dest)
+    print(f"Dataset snapshot created: {name}")
+    return name
+
+
 def load_dataset_jsonl(path: Path) -> list[dict]:
     """Load a JSONL dataset into a list of conversation dicts."""
     records = []
@@ -82,6 +115,9 @@ def main() -> None:
     if not args.train.exists():
         print(f"Training data not found: {args.train}", file=sys.stderr)
         sys.exit(1)
+
+    # Snapshot labeled data for reproducibility
+    snapshot_labeled_data()
 
     # ---- Load model (VLM — Qwen 3.5 is a unified vision-language model) ----
     from unsloth import FastVisionModel
