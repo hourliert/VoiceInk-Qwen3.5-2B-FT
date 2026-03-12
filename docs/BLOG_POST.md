@@ -60,7 +60,7 @@ The 2B was fast but terrible at following the cleanup instructions. And across a
 
 ### Adding the Logging Proxy
 
-That's when I built a lightweight Python reverse proxy ([`src/voiceink_proxy/server.py`](../src/voiceink_proxy/server.py)) that sits between VoiceInk and llama-server. It forwards every request transparently and logs the complete request/response pair as JSONL — the raw Parakeet transcript, the system prompt, the custom vocabulary, clipboard context, window context, the model's cleaned output, latency, everything.
+That's when I built a lightweight Python reverse proxy ([`src/voiceink_proxy/server.py`](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/voiceink_proxy/server.py)) that sits between VoiceInk and llama-server. It forwards every request transparently and logs the complete request/response pair as JSONL — the raw Parakeet transcript, the system prompt, the custom vocabulary, clipboard context, window context, the model's cleaned output, latency, everything.
 
 ```mermaid
 graph LR
@@ -75,7 +75,7 @@ This turned out to be the single most important decision in the project. Every d
 
 The proxy also handles a quirk of Qwen 3.5: even with thinking mode disabled, the model occasionally leaks `</think>` tokens into its output. The proxy injects `</think>` as a stop token into every request, catching these before they reach VoiceInk.
 
-A [systemd service](../systemd/llama-router.service) runs both processes on boot via a [startup script](../bin/start.sh). The entire proxy is standard-library Python — no pip dependencies.
+A [systemd service](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/systemd/llama-router.service) runs both processes on boot via a [startup script](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/bin/start.sh). The entire proxy is standard-library Python — no pip dependencies.
 
 ## The Model Progression
 
@@ -118,9 +118,9 @@ graph TD
     EV -.->|"iterate"| B
 ```
 
-### 1. Labeling ([`src/labeling/label.py`](../src/labeling/label.py))
+### 1. Labeling ([`src/labeling/label.py`](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/labeling/label.py))
 
-Each raw transcript from the proxy logs gets sent to Claude Sonnet 4.6 with a carefully crafted [judge prompt](../src/labeling/judge_prompt.txt). The judge receives the transcript along with structured context — custom vocabulary, clipboard content, active window title — all automatically populated and sent by VoiceInk with every request — and produces the ideal cleaned version.
+Each raw transcript from the proxy logs gets sent to Claude Sonnet 4.6 with a carefully crafted [judge prompt](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/labeling/judge_prompt.txt). The judge receives the transcript along with structured context — custom vocabulary, clipboard content, active window title — all automatically populated and sent by VoiceInk with every request — and produces the ideal cleaned version.
 
 ```
 Raw proxy log entry
@@ -138,9 +138,9 @@ The labeling runs with configurable parallelism (typically 5 concurrent calls). 
 
 **v2** added rules based on manual review of labeled samples. I found the judge was over-cleaning — stripping genuine reactions like "Cool" and "That's fair", sometimes fabricating content, and producing sentence fragments. Each problem became an explicit rule: keep affirmations, keep standalone assessments, never fabricate, never fragment.
 
-**v3** was a full rewrite aligned with a [product specification](PRODUCT_SPEC.md) I wrote to codify exactly what "good cleanup" means. The prompt switched to structured placeholders (`{transcript}`, `{custom_vocabulary}`, `{clipboard_context}`, `{window_context}`) fed by a shared [extraction module](../src/common/extract.py). It added guidance for French-English transfer patterns, Parakeet's phonetic misrecognitions (with real examples from my corpus like "slab" → "lap", "cloud code" → "Claude Code"), and a nuanced rule for "I think" — keep it when expressing a genuine opinion, remove only when it's clearly a throwaway hedge.
+**v3** was a full rewrite aligned with a [product specification](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/docs/PRODUCT_SPEC.md) I wrote to codify exactly what "good cleanup" means. The prompt switched to structured placeholders (`{transcript}`, `{custom_vocabulary}`, `{clipboard_context}`, `{window_context}`) fed by a shared [extraction module](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/common/extract.py). It added guidance for French-English transfer patterns, Parakeet's phonetic misrecognitions (with real examples from my corpus like "slab" → "lap", "cloud code" → "Claude Code"), and a nuanced rule for "I think" — keep it when expressing a genuine opinion, remove only when it's clearly a throwaway hedge.
 
-### 2. Dataset Preparation ([`src/training/prepare_dataset.py`](../src/training/prepare_dataset.py))
+### 2. Dataset Preparation ([`src/training/prepare_dataset.py`](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/training/prepare_dataset.py))
 
 Converts labeled records into chat format matching Qwen 3.5's [ChatML](https://huggingface.co/docs/transformers/en/chat_templating) chat template, which is what Unsloth expects for training. The script extracts structured components from each labeled record and reconstructs messages using a configurable system prompt — decoupling training data from whatever prompt VoiceInk happened to send at recording time. This means I can iterate on the VoiceInk prompt without relabeling.
 
@@ -158,7 +158,7 @@ The output uses typed content blocks (required for Qwen 3.5's unified VLM archit
 
 Data is split 90/10 into train and eval sets with a seeded shuffle for reproducibility.
 
-### 3. Training ([`src/training/finetune.py`](../src/training/finetune.py))
+### 3. Training ([`src/training/finetune.py`](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/training/finetune.py))
 
 Fine-tuning uses [Unsloth](https://unsloth.ai/) ([GitHub](https://github.com/unslothai/unsloth)) for LoRA training on the [Qwen 3.5 2B](https://huggingface.co/Qwen/Qwen3.5-2B) base model. Qwen 3.5 is technically a unified vision-language model, which means using `FastVisionModel` and `UnslothVisionDataCollator` even for text-only input — even though no images are involved.
 
@@ -174,9 +174,9 @@ The training script evolved significantly across iterations. The first version w
 
 **Quantization flexibility**: The script supports `--load-in-4bit` and `--load-in-8bit` for the base model, plus `--offload-optimizer` to move Adam states to CPU. These were added to handle training on longer synthetic sequences that pushed past the 16GB VRAM limit (more on this in [The VRAM Problem](#the-vram-problem)).
 
-### 4. Evaluation ([`src/eval/evaluate.py`](../src/eval/evaluate.py))
+### 4. Evaluation ([`src/eval/evaluate.py`](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/eval/evaluate.py))
 
-A comparative evaluation where Claude Sonnet 4.6 acts as judge. For each eval sample, both models produce output from the same input. The judge receives both outputs side-by-side in a single call — labeled "Output A" and "Output B" — and scores each on a [6-dimension rubric](../src/eval/judge_prompt.txt). This comparative approach (as opposed to scoring each output independently) lets the judge make fine-grained quality distinctions that would be hard to calibrate in isolation. The A/B assignment is randomized per sample to cancel out positional bias (LLM judges tend to slightly favor whichever output appears first).
+A comparative evaluation where Claude Sonnet 4.6 acts as judge. For each eval sample, both models produce output from the same input. The judge receives both outputs side-by-side in a single call — labeled "Output A" and "Output B" — and scores each on a [6-dimension rubric](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/eval/judge_prompt.txt). This comparative approach (as opposed to scoring each output independently) lets the judge make fine-grained quality distinctions that would be hard to calibrate in isolation. The A/B assignment is randomized per sample to cancel out positional bias (LLM judges tend to slightly favor whichever output appears first).
 
 | Dimension | Weight | What it measures |
 |---|---|---|
@@ -223,7 +223,7 @@ After fixing the sequence length bug and labeling more data (~400 samples), v2 t
 
 The turning point wasn't a training change — it was realizing that **label quality matters more than hyperparameters**.
 
-I reviewed labeled samples and found the judge was over-cleaning: stripping genuine reactions like "Cool" and "That's fair", fabricating content that the speaker never said, and producing sentence fragments. I wrote a [product specification](PRODUCT_SPEC.md) to codify exactly what "good cleanup" means, then rebuilt the judge prompt from scratch — switching from a raw input blob to structured placeholders, adding explicit rules for each failure mode I'd found, and adding guidance for French-English transfer patterns and Parakeet's phonetic misrecognitions.
+I reviewed labeled samples and found the judge was over-cleaning: stripping genuine reactions like "Cool" and "That's fair", fabricating content that the speaker never said, and producing sentence fragments. I wrote a [product specification](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/docs/PRODUCT_SPEC.md) to codify exactly what "good cleanup" means, then rebuilt the judge prompt from scratch — switching from a raw input blob to structured placeholders, adding explicit rules for each failure mode I'd found, and adding guidance for French-English transfer patterns and Parakeet's phonetic misrecognitions.
 
 Then I relabeled all 1,175 samples with the new prompt. The training hyperparameters also evolved based on evaluation results: LoRA rank doubled from 16 to 32 (alpha 16 → 64), epochs dropped from 3 to 1 (3 was overfitting), and learning rate went to 1e-4.
 
@@ -314,7 +314,7 @@ Four samples over 500 words out of 1,175 total. The model had essentially zero r
 
 ### Generating Realistic QA Debriefs
 
-I built a [synthetic data generator](../src/synthetic/generate.py) that uses Claude Sonnet 4.6 to produce matched pairs of messy STT transcripts and gold-standard cleaned versions. The [generator prompt](../src/synthetic/generator_prompt.txt) includes:
+I built a [synthetic data generator](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/synthetic/generate.py) that uses Claude Sonnet 4.6 to produce matched pairs of messy STT transcripts and gold-standard cleaned versions. The [generator prompt](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/synthetic/generator_prompt.txt) includes:
 
 - The exact coaching phrase structures from production: corners always referenced by numeric ID ("Corner 2", never "the first chicane"), braking instructions, consequence feedback, positive feedback, compound instructions
 - Realistic Parakeet error patterns: "brake" → "break", "Claude Code" → "cloud code", "chicane" → "chick in", "telemetry" → "tell a mystery"
