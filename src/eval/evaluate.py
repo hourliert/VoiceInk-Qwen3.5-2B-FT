@@ -128,7 +128,6 @@ def query_llama(messages: list[dict], model: str, host: str, port: int) -> tuple
         "messages": messages,
         "stream": False,
         "temperature": 0.3,
-        "max_tokens": 256,
     }).encode("utf-8")
 
     start = time.monotonic()

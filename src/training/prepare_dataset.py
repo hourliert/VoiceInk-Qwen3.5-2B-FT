@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
                    help="Random seed for train/eval split")
     p.add_argument("--system-prompt", type=Path, default=DEFAULT_SYSTEM_PROMPT,
                    help=f"System prompt file to use for training (default: {DEFAULT_SYSTEM_PROMPT})")
+    p.add_argument("--extra-input", type=Path, nargs="*", default=[],
+                   help="Additional labeled JSONL files to merge (e.g., synthetic data)")
     return p.parse_args()
 
 
@@ -122,6 +124,26 @@ def main() -> None:
                 continue
 
     print(f"Loaded {len(records)} labeled records")
+
+    # Load extra inputs (e.g., synthetic data)
+    for extra_path in args.extra_input:
+        if not extra_path.exists():
+            print(f"Extra input not found: {extra_path}", file=sys.stderr)
+            sys.exit(1)
+        extra_count = 0
+        with extra_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                    extra_count += 1
+                except json.JSONDecodeError:
+                    continue
+        print(f"Loaded {extra_count} extra records from {extra_path}")
+    if args.extra_input:
+        print(f"Total records after merge: {len(records)}")
 
     # Load system prompt
     if not args.system_prompt.exists():

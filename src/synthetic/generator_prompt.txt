@@ -1,0 +1,129 @@
+You are generating synthetic training data for a speech-to-text fine-tuning dataset.
+
+You will produce a REALISTIC raw speech-to-text transcript of a QA debrief session
+for GT Coach, a sim-racing coaching app for Gran Turismo 7. You will also produce
+the gold-standard cleaned version of that transcript.
+
+SPEAKER CONTEXT:
+- French non-native English speaker dictating while driving in a racing simulator
+- He is narrating his QA testing of GT Coach, his own app
+- He interleaves his own commentary with what the coaching app says aloud
+- The coaching app speaks corner-by-corner feedback during each lap
+- He sometimes comments on bugs, features, or observations about the app
+- He occasionally addresses Claude Code (his coding assistant) about fixes needed
+
+TRACK: {track}
+SCENARIO: {scenario}
+TARGET LENGTH: approximately {target_words} words for the raw transcript
+VARIATION SEED: {seed}
+
+QA DEBRIEF STRUCTURE:
+1. Setup (50-100 words): what track, what's being tested, current app state
+2. Live narration (bulk): corner-by-corner coaching interleaved with speaker commentary
+3. Bug observations (interspersed): noticing issues, discussing fixes
+4. Wrap-up (50-100 words): summary of findings, next steps
+
+GT COACH COACHING PHRASES — USE THESE EXACT PATTERNS:
+The coach always refers to corners by numeric ID, NEVER by name.
+The coach uses these specific phrase structures:
+
+Braking instructions:
+- "Corner [N], brake one beat earlier."
+- "Corner [N], brake one beat later."
+- "Corner [N], commit to braking later."
+- "Corner [N] coming up, brake one beat earlier."
+
+Consequence feedback:
+- "It carried into corner [N]. Your mid-corner speed is down."
+- "You brake too early. That rushed your turn-in, running tight on exit."
+- "You brake too late. That rushed your turn-in, running tight on exit."
+- "You lifted for too long, costing exit speed."
+- "That cost you [time]." (e.g., "three tenths", "a second", "1.9 seconds")
+- "That exit cost you about [time] on the run-out."
+- "You lost [time]." / "You lost [time] here last lap."
+
+Positive feedback:
+- "That earlier turn-in paid off. You gained [time]."
+- "Corner [N], you gained [time]."
+- "Corner [N], solid rhythm. You gain [time]."
+- "Corner [N], much smoother. You're up [time]."
+
+Compound instructions:
+- "Corner [N], shorten the lift. Corner [M] depends on it."
+- "Corner [N], turn in a bit earlier. That carries through corner [M]."
+- "Corners [N] and [M], smooth steering in at each."
+- "Corner [N], smooth your initial steering input."
+- "Corners [N], [M], and [P], delayed turn-in slightly at each."
+
+These coaching phrases REPEAT naturally across laps because the coach gives
+similar advice about the same corners each time. This repetition is INTENTIONAL
+and MUST be preserved in both the raw transcript and the clean version.
+
+REALISTIC STT ERRORS — YOU MUST INCLUDE THESE:
+The speech-to-text engine (Parakeet V2) makes specific types of errors.
+Include a realistic density of these throughout the raw transcript:
+
+Phonetic substitutions (real English words that sound similar but are wrong):
+- "brake" → "break" (VERY common, use this frequently)
+- "lap" → "slab" or "lab" (occasional)
+- "turn-in" → "turning" (occasional)
+- "GT Coach" → "D V Coach" or "GT couch" or "DT coach" (occasional)
+- "Claude Code" → "cloud code" (when mentioned)
+- "chicane" → "chick in" or "she can" (occasional)
+- "outlier" → "out liar" (occasional)
+- "telemetry" → "tell a mystery" or "tellemitry" (rare)
+- "sector" → "scepter" (rare)
+
+Word splitting (STT splits compound words):
+- "VoiceInk" → "voice ink"
+- "Nürburgring" → "nurberg ring"
+- "brakepoint" → "break point"
+
+French-English transfer patterns (speaker grammar errors):
+- "we are Monday" instead of "today is Monday"
+- "it depends of" instead of "it depends on"
+- "help for" instead of "help with"
+- "I am agree" instead of "I agree"
+- "how it's working" instead of "how is it working"
+- Missing or wrong articles
+
+Filler words and verbal tics (include generously):
+- "so", "like", "basically", "I mean", "alright", "okay so", "you know"
+- "right", "okay good", "the only thing I would say is"
+- "um", "uh", false starts, self-corrections
+- "I think" used as hedge before directives
+
+OUTPUT FORMAT:
+Produce exactly two sections, clearly delimited:
+
+<RAW_TRANSCRIPT>
+The messy STT output as Parakeet V2 would produce it. Include all the errors
+listed above at a realistic density. No punctuation corrections — STT output
+has imperfect punctuation. Include the speaker's filler words, false starts,
+and French transfer patterns.
+</RAW_TRANSCRIPT>
+
+<CLEAN_TRANSCRIPT>
+The gold-standard cleaned version:
+- All STT errors corrected ("break" → "brake", "cloud code" → "Claude Code", etc.)
+- Filler words removed ("so", "like", "basically", "um", etc.)
+- Grammar fixed (French transfer patterns corrected)
+- Self-corrections resolved (keep only final intent)
+- Coaching phrases preserved EXACTLY as the coach would say them (including
+  all repetitions across laps)
+- Natural contractions used ("I'm", "it's", "don't")
+- Clean punctuation and paragraph breaks for readability
+- Greetings, reactions, and assessments preserved ("Cool", "Amazing", "That's fair")
+- "I think" kept when expressing opinion, removed only when clearly a throwaway hedge
+</CLEAN_TRANSCRIPT>
+
+CRITICAL RULES:
+- The raw transcript must feel like real dictation — messy, imperfect, stream-of-consciousness
+- The clean transcript must feel like a polished but faithful version of the same content
+- Do NOT summarize or shorten — the clean version should be roughly the same length
+  as the raw version (minus filler words and corrections)
+- ALL coaching phrase repetitions across laps MUST be preserved in both versions
+- Corner references are ALWAYS by number (corner 2, corner 17), NEVER by name
+- Time values should be realistic: tenths, half seconds, seconds, occasionally multiple seconds for crashes
+- The speaker sometimes crashes deliberately (for QA testing) and comments on how the app handles it
+- Include {target_words} words approximately in the raw transcript
