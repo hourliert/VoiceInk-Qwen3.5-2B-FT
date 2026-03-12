@@ -45,6 +45,10 @@ def parse_args() -> argparse.Namespace:
                    help="Max sequence length for training")
     p.add_argument("--load-in-4bit", action="store_true",
                    help="Load base model in 4bit (saves VRAM, slightly lower quality)")
+    p.add_argument("--load-in-8bit", action="store_true",
+                   help="Load base model in 8bit (saves ~2GB VRAM, minor quality impact)")
+    p.add_argument("--offload-optimizer", action="store_true",
+                   help="Offload optimizer states to CPU (saves ~3GB VRAM, slower training)")
 
     # LoRA
     p.add_argument("--r", type=int, default=32, help="LoRA rank")
@@ -128,6 +132,7 @@ def main() -> None:
         args.base_model,
         max_seq_length=args.max_seq_length,
         load_in_4bit=args.load_in_4bit,
+        load_in_8bit=args.load_in_8bit,
         use_gradient_checkpointing="unsloth",
     )
 
@@ -184,7 +189,8 @@ def main() -> None:
             max_steps=args.max_steps if args.max_steps > 0 else -1,
             learning_rate=args.lr,
             logging_steps=10,
-            optim="adamw_8bit",
+            optim="adamw_8bit" if not args.offload_optimizer else "adamw_torch",
+            optim_args="cpu_offload=True" if args.offload_optimizer else None,
             weight_decay=0.01,
             lr_scheduler_type="cosine",
             seed=3407,
