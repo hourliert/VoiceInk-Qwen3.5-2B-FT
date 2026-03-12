@@ -107,7 +107,7 @@ The pipeline has four stages, each built as a standalone Python script:
 
 ```mermaid
 graph TD
-    A["Proxy Logs<br/>1,175 real requests"] --> B["Label with Claude<br/>(LLM-as-judge)"]
+    A["Proxy Logs<br/>1,451 real requests"] --> B["Label with Claude<br/>(LLM-as-judge)"]
     B --> C["datasets/labeled.jsonl"]
     S["Synthetic Generator<br/>(Claude Sonnet 4.6)"] --> SD["datasets/synthetic/labeled.jsonl"]
     C --> P["Prepare Dataset"]
@@ -130,7 +130,7 @@ Raw proxy log entry
   → Save to datasets/labeled.jsonl (dedup by request_id)
 ```
 
-The labeling runs with configurable parallelism (typically 5 concurrent calls). 1,175 samples took about 45 minutes.
+The labeling runs with configurable parallelism (typically 5 concurrent calls). 1,451 samples took about an hour.
 
 **The judge prompt went through three major iterations:**
 
@@ -206,7 +206,7 @@ graph LR
     V1["<b>v1–v2</b><br/>90→400 samples<br/>Loss 2.22→0.56<br/>seq_length bug fixed"]
     V3["<b>v3</b><br/>1,175 relabeled<br/>New judge prompt<br/><b>89.8</b> vs 84.0"]
     V4["<b>v4</b><br/>Completions-only<br/>Loss 0.85→0.15<br/><b>92.1</b> vs 84.0"]
-    V5["<b>v5</b><br/>+120 synthetic<br/>Long QA fixed<br/><b>91.5</b> + stop"]
+    V5["<b>v5</b><br/>+160 synthetic<br/>Long QA fixed<br/><b>91.5</b> + stop"]
     V1 --> V3 --> V4 -->|"production bug"| V5
 
     style V4 fill:#d4edda,stroke:#28a745
@@ -321,13 +321,13 @@ I built a [synthetic data generator](https://github.com/hourliert/VoiceInk-Qwen3
 - French-English transfer patterns in the speaker's narration
 - Natural structure: setup → live narration with coaching → bug observations → wrap-up
 
-Each call produces both the raw transcript and the clean label in one shot, ensuring perfect alignment. 120 samples across varying lengths (500-3,500 words), with diversity across tracks, scenarios, and coaching patterns.
+Each call produces both the raw transcript and the clean label in one shot, ensuring perfect alignment. 160 samples across varying lengths (500-3,500 words), with diversity across tracks, scenarios, and coaching patterns.
 
 The generation is resumable — if it crashes at sample 60, rerunning the same command skips already-generated samples and continues from 61.
 
 ### The VRAM Problem
 
-Training on the merged dataset (1,175 real + 120 synthetic) immediately hit out-of-memory errors that hadn't occurred before.
+Training on the merged dataset (1,451 real + 160 synthetic) immediately hit out-of-memory errors that hadn't occurred before.
 
 The reason is straightforward when you look at the numbers. During a training forward+backward pass, VRAM usage scales with sequence length. The key consumers are:
 
@@ -399,7 +399,7 @@ Meaning preservation and instruction following are near-ceiling for all models �
 
 **Audit your training data distribution, not just your training data quality.** I spent significant effort improving label quality (three judge prompt iterations, a full product spec, a complete relabel, manual reviews) — and that was worth it. But I didn't look at the length distribution until the production bug forced me to. Four samples over 500 words out of 1,175 is obvious in hindsight. A histogram of input lengths should have been the first thing I checked.
 
-**The proxy was the best decision in the project.** Every other component — labeling, training, evaluation, synthetic data — exists because the proxy was silently collecting real-world data from the start. 1,175 samples with zero annotation effort. If I'd tried to build a data collection workflow from scratch, I probably never would have started fine-tuning.
+**The proxy was the best decision in the project.** Every other component — labeling, training, evaluation, synthetic data — exists because the proxy was silently collecting real-world data from the start. 1,451 samples with zero annotation effort. If I'd tried to build a data collection workflow from scratch, I probably never would have started fine-tuning.
 
 ## The Stack
 
@@ -412,12 +412,12 @@ Meaning preservation and instruction following are near-ceiling for all models �
 | Development | [Claude Code](https://claude.ai/claude-code) |
 | Dictation app | [VoiceInk](https://voiceink.app) with Parakeet V2 STT |
 
-The full pipeline — from raw proxy logs to deployed GGUF — runs in five commands and takes about two hours end-to-end (45 minutes labeling, 30 minutes synthetic generation, 10 minutes dataset prep + training, 45 minutes evaluation). The model is running in production now, cleaning up every dictation I send through VoiceInk.
+The full pipeline — from raw proxy logs to deployed GGUF — runs in five commands and takes about three hours end-to-end (1 hour labeling, 40 minutes synthetic generation, 10 minutes dataset prep + training, 1 hour evaluation). The model is running in production now, cleaning up every dictation I send through VoiceInk.
 
 ## Cost
 
 The GPU is an RTX 4080 Super I bought for £800 — it's a gaming PC that doubles as an ML workstation. The entire training process was 5-6 runs at ~20 minutes each. The full PC draws about 500W from the wall during training, so that's roughly 1 kWh total. At London electricity rates (~£0.30/kWh), the compute cost of fine-tuning was under £1.
 
-The real cost is the [Claude Max plan](https://claude.ai) subscription, which I use for development anyway. Labeling 1,175 samples, generating 120 synthetic samples, running evaluations, and building the entire codebase with Claude Code all ran through that subscription. No per-token API costs, no cloud GPU rentals, no training infrastructure to manage.
+The real cost is the [Claude Max plan](https://claude.ai) subscription, which I use for development anyway. Labeling 1,451 samples, generating 160 synthetic samples, running evaluations, and building the entire codebase with Claude Code all ran through that subscription. No per-token API costs, no cloud GPU rentals, no training infrastructure to manage.
 
 No part of this project required spending money I wasn't already spending.
