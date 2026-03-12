@@ -178,14 +178,14 @@ The training script evolved significantly across iterations. The first version w
 
 A comparative evaluation where Claude Sonnet 4.6 acts as judge. For each eval sample, both models produce output from the same input. The judge receives both outputs side-by-side in a single call — labeled "Output A" and "Output B" — and scores each on a [6-dimension rubric](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/eval/judge_prompt.txt). This comparative approach (as opposed to scoring each output independently) lets the judge make fine-grained quality distinctions that would be hard to calibrate in isolation. The A/B assignment is randomized per sample to cancel out positional bias (LLM judges tend to slightly favor whichever output appears first).
 
-| Dimension | Weight | What it measures |
-|---|---|---|
-| Meaning preservation | 3x | Did it faithfully represent what was said? |
-| Instruction following | 3x | Did it stay in role as a transcription enhancer? |
-| Filler removal | 2x | Did it clean verbal tics and conversational fluff? |
-| Grammar/fluency | 2x | Did it fix errors, especially non-native patterns? |
-| Technical accuracy | 2x | Did it get names and terms right per vocabulary? |
-| Conciseness | 1x | Did it tighten unnecessary verbosity? |
+| Dimension | Weight | What it measures | Why it matters for dictation |
+|---|---|---|---|
+| Meaning preservation | 3x | Did it faithfully represent what was said? | The model must never fabricate, drop, or alter the speaker's intent |
+| Instruction following | 3x | Did it stay in role as a transcription enhancer? | Base models often answer questions from the transcript instead of cleaning them |
+| Filler removal | 2x | Did it clean verbal tics and conversational fluff? | Raw dictation is dense with "so", "like", "basically" — the core cleanup task |
+| Grammar/fluency | 2x | Did it fix errors, especially non-native patterns? | French-English transfer patterns ("depends of", "we are Monday") need correction |
+| Technical accuracy | 2x | Did it get names and terms right per vocabulary? | Parakeet produces phonetic substitutions ("break" for "brake", "chicken" for "chicane") |
+| Conciseness | 1x | Did it tighten unnecessary verbosity? | Lower weight — cleaning should preserve the speaker's voice, not rewrite it |
 
 Each dimension is scored 1-5, weighted and normalized to a 0-100 overall score.
 
@@ -206,7 +206,7 @@ graph LR
     V1["<b>v1–v2</b><br/>90→400 samples<br/>Loss 2.22→0.56<br/>seq_length bug fixed"]
     V3["<b>v3</b><br/>1,175 relabeled<br/>New judge prompt<br/><b>89.8</b> vs 84.0"]
     V4["<b>v4</b><br/>Completions-only<br/>Loss 0.85→0.15<br/><b>92.1</b> vs 84.0"]
-    V5["<b>v5</b><br/>+120 synthetic<br/>Long QA fixed<br/><b>91.6</b> + stop"]
+    V5["<b>v5</b><br/>+120 synthetic<br/>Long QA fixed<br/><b>91.5</b> + stop"]
     V1 --> V3 --> V4 -->|"production bug"| V5
 
     style V4 fill:#d4edda,stroke:#28a745
@@ -247,7 +247,7 @@ Using Unsloth's `UnslothVisionDataCollator` with `train_on_responses_only=True`,
 
 The fine-tuned 2B was now beating both the 4B and 9B models — at 2.2x the speed of the 4B and roughly 3x the speed of the 9B.
 
-*A note on methodology: these evaluations use LLM-as-judge scoring, not statistical significance tests. The sample size (130 eval samples) and the magnitude of the gaps give reasonable confidence, but this is not a rigorous ML benchmark. The practical validation — deploying the model and using it daily for real dictation — matters more.*
+*These v4 evaluations used 130 eval samples with LLM-as-judge scoring. Full methodology and final results across all model sizes are in [Results](#results).*
 
 ## The Production Bug
 
@@ -349,8 +349,8 @@ The quality impact of 4-bit base model loading during LoRA training is minimal �
 After retraining with the merged dataset:
 
 **Short dictation** (the common case):
-- Score: 91.6 vs 81.9 (4B baseline) — essentially unchanged from v4
-- Speed: 2.3x faster than 4B
+- Score: 91.5 vs 81.4 (4B baseline) — essentially unchanged from v4
+- Speed: 2.1x faster than 4B
 
 **Long QA debrief** (the bug):
 
@@ -362,6 +362,34 @@ After retraining with the merged dataset:
 | Output/input ratio | 2.2x (amplifying) | **0.57x** (compressing) |
 
 The model now stops naturally, preserves all coaching phrase repetitions faithfully (without amplifying them), and finishes in under 10 seconds. The remaining repeated 8-grams in the output match the actual repetition in the input — the coach genuinely says similar things each lap.
+
+## Results
+
+After the final training run, I evaluated the fine-tuned 2B against every Qwen 3.5 model I could fit on the RTX 4080 Super (16GB VRAM). The 2B, 4B, and 9B baselines all use Q4_K_XL quantization (the recommended Unsloth dynamic quantization). The 35B-A3B is a mixture-of-experts model with only 3B active parameters — fast for its size, but it requires aggressive Q2_K_XL quantization to fit in 16GB, which degrades its quality. The fine-tuned model is exported as Q4_K_M GGUF.
+
+| Model | Quant | Score | FT 2B | Gap | Win rate | Speed |
+|---|---|---|---|---|---|---|
+| Qwen 3.5 2B | Q4_K_XL | 79.7 | **91.1** | +11.4 | 77% (124/161) | 1.0x |
+| Qwen 3.5 4B | Q4_K_XL | 81.4 | **91.5** | +10.1 | 77% (124/161) | 2.1x |
+| Qwen 3.5 9B | Q4_K_XL | 81.6 | **90.9** | +9.3 | 75% (121/161) | 3.2x |
+| Qwen 3.5 35B-A3B | Q2_K_XL | 84.5 | **91.8** | +7.3 | 67% (108/161) | 2.3x |
+
+The fine-tuned 2B beats every model, including one 17× its size. The 35B-A3B is the strongest baseline — its MoE architecture helps even at 2-bit quantization — but still loses by 7.3 points with a 67% win rate.
+
+The per-dimension scores reveal where fine-tuning makes the difference:
+
+| Dimension | Weight | FT 2B | Baselines | Gap |
+|---|---|---|---|---|
+| Meaning preservation | 3x | 4.24–4.28 | 4.20–4.37 | ~0 |
+| Instruction following | 3x | 4.94–4.96 | 4.78–4.96 | small |
+| **Filler removal** | 2x | **4.37–4.43** | 2.68–3.22 | **+1.3** |
+| **Grammar/fluency** | 2x | **4.57–4.65** | 3.71–4.25 | **+0.6** |
+| Technical accuracy | 2x | 4.61–4.67 | 4.27–4.56 | +0.2 |
+| **Conciseness** | 1x | **4.42–4.45** | 2.90–3.43 | **+1.2** |
+
+Meaning preservation and instruction following are near-ceiling for all models — the base Qwen 3.5 architecture handles these well out of the box. The gap is entirely in filler removal, grammar, and conciseness: the exact behaviors that require task-specific training data to learn. No amount of prompt engineering gets a base model from 2.68 to 4.40 on filler removal.
+
+*161 eval samples per comparison, LLM-as-judge scoring with Claude Sonnet 4.6. These are not statistical significance tests — the sample size and magnitude of the gaps give reasonable confidence, but this is practical evaluation, not a rigorous ML benchmark. The 35B-A3B comparison should be read with the caveat that Q2_K_XL quantization degrades quality — a less quantized 35B-A3B would likely score higher. The practical validation is deploying the model and using it daily for real dictation.*
 
 ## What I'd Do Differently
 
