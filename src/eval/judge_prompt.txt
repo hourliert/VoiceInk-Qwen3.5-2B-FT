@@ -66,5 +66,5 @@ OUTPUT A:
 OUTPUT B:
 {output_b}
 
-Respond with ONLY a JSON object, no other text:
-{{"output_a": {{"meaning_preservation": <1-5>, "filler_removal": <1-5>, "grammar_fluency": <1-5>, "technical_accuracy": <1-5>, "conciseness": <1-5>, "instruction_following": <1-5>, "notes": "<one sentence>"}}, "output_b": {{"meaning_preservation": <1-5>, "filler_removal": <1-5>, "grammar_fluency": <1-5>, "technical_accuracy": <1-5>, "conciseness": <1-5>, "instruction_following": <1-5>, "notes": "<one sentence>"}}}}
+Respond with ONLY a JSON object, no other text. Do NOT include notes or explanations.
+{{"output_a": {{"meaning_preservation": <1-5>, "filler_removal": <1-5>, "grammar_fluency": <1-5>, "technical_accuracy": <1-5>, "conciseness": <1-5>, "instruction_following": <1-5>}}, "output_b": {{"meaning_preservation": <1-5>, "filler_removal": <1-5>, "grammar_fluency": <1-5>, "technical_accuracy": <1-5>, "conciseness": <1-5>, "instruction_following": <1-5>}}}}

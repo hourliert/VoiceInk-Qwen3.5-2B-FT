@@ -56,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for A/B assignment")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Resume from a previous eval JSONL (skips already-judged samples)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print judge prompts without calling Claude")
     return p.parse_args()
@@ -94,6 +96,21 @@ def load_eval_data(path: Path) -> list[dict]:
                 ],
             })
     return samples
+
+
+def load_cached_results(path: Path) -> dict[str, dict]:
+    """Load previous eval JSONL, keyed by raw_transcript for matching."""
+    cache = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            key = record.get("raw_transcript", "")
+            if key and "baseline_scores" in record and "candidate_scores" in record:
+                cache[key] = record
+    return cache
 
 
 # ---- Model inference ----
@@ -145,7 +162,6 @@ def call_claude(prompt: str, model: str) -> str:
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     result = subprocess.run(
         ["claude", "-p", prompt, "--model", model,
-         "--max-tokens", "1024",
          "--disable-slash-commands", "--allowed-tools", ""],
         capture_output=True, text=True, timeout=600, env=env,
     )
@@ -198,15 +214,25 @@ def judge_one(
         print(f"  A={a_is}, B={'candidate' if a_is == 'baseline' else 'baseline'}")
         return None
 
-    try:
-        raw = call_claude(prompt, judge_model)
-    except Exception as exc:
-        print(f"  JUDGE ERROR: {exc}", file=sys.stderr)
-        return None
+    for attempt in range(2):
+        try:
+            raw = call_claude(prompt, judge_model)
+        except Exception as exc:
+            print(f"  JUDGE ERROR: {exc}", file=sys.stderr)
+            return None
 
-    parsed = parse_judge_response(raw)
-    if not parsed or "output_a" not in parsed or "output_b" not in parsed:
-        print(f"  PARSE ERROR: {raw[:200]}", file=sys.stderr)
+        parsed = parse_judge_response(raw)
+        if parsed and "output_a" in parsed and "output_b" in parsed:
+            break
+        label = "PARSE ERROR" if attempt == 0 else "PARSE ERROR (retry failed)"
+        print(f"  {label}: {raw[:200]}", file=sys.stderr)
+        # Log full failed response for debugging
+        err_path = ROOT / "results" / "judge_errors.jsonl"
+        err_path.parent.mkdir(parents=True, exist_ok=True)
+        with err_path.open("a", encoding="utf-8") as ef:
+            ef.write(json.dumps({"sample_index": seed_offset, "attempt": attempt,
+                                 "raw_response": raw}, ensure_ascii=False) + "\n")
+    else:
         return None
 
     # Map A/B back to baseline/candidate
@@ -420,68 +446,117 @@ def main() -> None:
         samples = samples[:args.limit]
     print(f"Loaded {len(samples)} eval samples")
 
-    # Warm up + generate for each model (warmup forces model load so first
-    # timed sample isn't biased by cold-load latency)
-    warmup_msgs = [{"role": "user", "content": "Hello"}]
+    # Load cache from previous run if resuming
+    cache = {}
+    if args.resume:
+        if args.resume.exists():
+            cache = load_cached_results(args.resume)
+            print(f"Loaded {len(cache)} cached results from {args.resume}")
+        else:
+            print(f"WARNING: resume file not found: {args.resume}")
 
-    print(f"Warming up {args.baseline}...", end=" ", flush=True)
-    try:
-        _, ms = query_llama(warmup_msgs, args.baseline, args.llama_host, args.llama_port)
-        print(f"{ms:.0f}ms (discarded)")
-    except Exception as exc:
-        print(f"WARNING: warmup failed: {exc}")
+    # Split samples into cached vs uncached
+    cached_indices = []
+    uncached_indices = []
+    for i, sample in enumerate(samples):
+        if sample["raw_transcript"] in cache:
+            cached_indices.append(i)
+        else:
+            uncached_indices.append(i)
 
-    print(f"\nGenerating baseline outputs ({args.baseline})...")
-    baseline_outputs = generate_outputs(samples, args.baseline, args.llama_host, args.llama_port)
+    if cache:
+        print(f"  {len(cached_indices)} cached, {len(uncached_indices)} to evaluate")
 
-    print(f"\nWarming up {args.candidate}...", end=" ", flush=True)
-    try:
-        _, ms = query_llama(warmup_msgs, args.candidate, args.llama_host, args.llama_port)
-        print(f"{ms:.0f}ms (discarded)")
-    except Exception as exc:
-        print(f"WARNING: warmup failed: {exc}")
+    # Build result arrays — pre-fill from cache
+    baseline_outputs = [None] * len(samples)
+    candidate_outputs = [None] * len(samples)
+    judge_results = {}
 
-    print(f"\nGenerating candidate outputs ({args.candidate})...")
-    candidate_outputs = generate_outputs(samples, args.candidate, args.llama_host, args.llama_port)
+    for i in cached_indices:
+        c = cache[samples[i]["raw_transcript"]]
+        baseline_outputs[i] = {
+            "text": c["baseline_output"],
+            "duration_ms": c.get("baseline_duration_ms", 0),
+        }
+        candidate_outputs[i] = {
+            "text": c["candidate_output"],
+            "duration_ms": c.get("candidate_duration_ms", 0),
+        }
+        judge_results[i] = {
+            "baseline_scores": c["baseline_scores"],
+            "candidate_scores": c["candidate_scores"],
+        }
 
-    # Judge each pair — track results by index so we can filter consistently
-    print(f"\nJudging outputs ({args.judge_model})...")
-    judge_results = {}  # index -> judgment dict (None for failures)
-    errors = 0
+    # Run inference + judging only for uncached samples
+    if uncached_indices:
+        uncached_samples = [samples[i] for i in uncached_indices]
 
-    if args.parallel <= 1 or args.dry_run:
-        for i, (sample, b_out, c_out) in enumerate(
-            zip(samples, baseline_outputs, candidate_outputs)
-        ):
-            print(f"  [{i+1}/{len(samples)}]", end=" ")
-            result = judge_one(sample, b_out["text"], c_out["text"],
-                              args.judge_model, args.dry_run, i)
-            judge_results[i] = result
-            if not result:
-                errors += 1
-    else:
-        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-            futures = {}
-            for i, (sample, b_out, c_out) in enumerate(
-                zip(samples, baseline_outputs, candidate_outputs)
-            ):
-                fut = pool.submit(judge_one, sample, b_out["text"], c_out["text"],
-                                  args.judge_model, False, i)
-                futures[fut] = i
+        # Warm up + generate for each model
+        warmup_msgs = [{"role": "user", "content": "Hello"}]
 
-            done_count = 0
-            for fut in as_completed(futures):
-                i = futures[fut]
-                done_count += 1
-                print(f"  [{done_count}/{len(samples)}] Judged sample {i}")
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    print(f"  ERROR: {exc}", file=sys.stderr)
-                    result = None
+        print(f"Warming up {args.baseline}...", end=" ", flush=True)
+        try:
+            _, ms = query_llama(warmup_msgs, args.baseline, args.llama_host, args.llama_port)
+            print(f"{ms:.0f}ms (discarded)")
+        except Exception as exc:
+            print(f"WARNING: warmup failed: {exc}")
+
+        print(f"\nGenerating baseline outputs ({args.baseline})...")
+        b_outs = generate_outputs(uncached_samples, args.baseline, args.llama_host, args.llama_port)
+
+        print(f"\nWarming up {args.candidate}...", end=" ", flush=True)
+        try:
+            _, ms = query_llama(warmup_msgs, args.candidate, args.llama_host, args.llama_port)
+            print(f"{ms:.0f}ms (discarded)")
+        except Exception as exc:
+            print(f"WARNING: warmup failed: {exc}")
+
+        print(f"\nGenerating candidate outputs ({args.candidate})...")
+        c_outs = generate_outputs(uncached_samples, args.candidate, args.llama_host, args.llama_port)
+
+        for j, i in enumerate(uncached_indices):
+            baseline_outputs[i] = b_outs[j]
+            candidate_outputs[i] = c_outs[j]
+
+        # Judge uncached pairs
+        print(f"\nJudging {len(uncached_indices)} new outputs ({args.judge_model})...")
+        errors = 0
+
+        if args.parallel <= 1 or args.dry_run:
+            for j, i in enumerate(uncached_indices):
+                print(f"  [{j+1}/{len(uncached_indices)}]", end=" ")
+                result = judge_one(samples[i], baseline_outputs[i]["text"],
+                                  candidate_outputs[i]["text"],
+                                  args.judge_model, args.dry_run, i)
                 judge_results[i] = result
                 if not result:
                     errors += 1
+        else:
+            with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+                futures = {}
+                for j, i in enumerate(uncached_indices):
+                    fut = pool.submit(judge_one, samples[i],
+                                      baseline_outputs[i]["text"],
+                                      candidate_outputs[i]["text"],
+                                      args.judge_model, False, i)
+                    futures[fut] = i
+
+                done_count = 0
+                for fut in as_completed(futures):
+                    i = futures[fut]
+                    done_count += 1
+                    print(f"  [{done_count}/{len(uncached_indices)}] Judged sample {i}")
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        print(f"  ERROR: {exc}", file=sys.stderr)
+                        result = None
+                    judge_results[i] = result
+                    if not result:
+                        errors += 1
+    else:
+        errors = 0
+        print("\nAll samples cached, skipping inference and judging.")
 
     if args.dry_run:
         print("\nDry run complete.")
