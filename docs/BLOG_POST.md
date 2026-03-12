@@ -16,6 +16,26 @@ The dictation workflow has two distinct modes:
 
 Both modes need real-time cleanup. My raw dictation comes with filler words ("so", "like", "basically"), French grammar patterns (I'm a native French speaker — "we are Monday" instead of "today is Monday", "it depends of" instead of "it depends on"), and speech-to-text misrecognitions. The LLM's job is to fix all of that transparently, so my coding assistant or my notes get clean text.
 
+Here's what that looks like in practice — real samples from the training data, showing the raw speech-to-text output and the cleaned version:
+
+> **Raw:** So if you reflect on all the messages I've sent to you in this conversation, I've actually dictated all of them through Voice Inc. and they all went through QEN 3.5 Forbi.
+>
+> **Cleaned:** If you reflect on all the messages I've sent to you in this conversation, I've dictated all of them through VoiceInk and they all went through Qwen 3.5 4B.
+
+Fillers removed ("so", "actually"), STT misrecognitions fixed ("Voice Inc." → "VoiceInk", "QEN 3.5 Forbi" → "Qwen 3.5 4B").
+
+> **Raw:** Wait, I I'm sure we do instantiate yourself with my cloud code tokens during CI, for instance, on another project.
+>
+> **Cleaned:** I'm sure we do instantiate you with my Claude Code tokens during CI, for instance on another project.
+
+Stutter removed ("Wait, I I'm" → "I'm"), phonetic STT error fixed ("cloud code" → "Claude Code").
+
+> **Raw:** So I think the correct fix is probably there's two fixes we need to do. One is we need to mutate locally this reference package, which I believe is a binary file with like the prefixes, some kind of like metadata to switch from monza to monza node chicain
+>
+> **Cleaned:** I think there are two fixes we need to do. One is we need to locally mutate this reference package, which I believe is a binary file with the prefixes, some kind of metadata to switch from Monza to Monza No Chicane.
+
+Fillers removed ("so", "like"), French word order fixed ("mutate locally this" → "locally mutate this"), grammar corrected ("there's two" → "there are two"), STT errors fixed ("monza node chicain" → "Monza No Chicane").
+
 ## The Infrastructure
 
 ### Starting Simple
