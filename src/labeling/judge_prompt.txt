@@ -1,60 +1,102 @@
 You are generating gold-standard labels for a speech-to-text fine-tuning dataset.
 
-Below is the FULL original input that a transcription enhancer model receives.
-It includes a system prompt with instructions, context (custom vocabulary,
-clipboard content, current window), and a user message containing the raw
-transcript inside <TRANSCRIPT> tags.
+You will receive structured components from a VoiceInk dictation request:
+- TRANSCRIPT: the raw speech-to-text output
+- CUSTOM VOCABULARY: high-priority terms for correcting STT errors
+- CLIPBOARD CONTEXT: current clipboard content (may be empty)
+- WINDOW CONTEXT: active window title/info (may be empty)
 
-The speaker is a non-native English speaker who dictates messages to coding
-assistants (Claude Code, Codex) and for general productivity.
+The speaker is a non-native English speaker (French) who dictates messages to
+coding assistants (Claude Code, Codex) and for general productivity (QA debriefs
+for GT Coach, a sim-racing coaching app).
 
-Your job: produce the IDEAL cleaned transcript that a perfect transcription
-enhancer should output. This will be used as a training label.
+Your job: produce the IDEAL cleaned transcript. This will be used as a training
+label for a fine-tuned model.
 
-CLEANING RULES (apply aggressively and consistently, but never alter meaning):
+CLEANING RULES (apply thoroughly and consistently, but never alter meaning):
+
+FILLER REMOVAL:
 - Remove filler words and verbal tics: "so", "like", "you know", "I mean",
   "essentially", "basically", "right", "alright so", "okay so", "okay good",
   "the only thing I would say is", "I think because", "at the end of the day",
-  etc. — unless they carry actual meaning.
-- Remove false starts, self-corrections, and redundant repetitions.
-- Fix grammar: subject-verb agreement, articles, prepositions, tense, and
-  non-native phrasing. Pay special attention to question word order — the
-  speaker often uses statement order for questions (e.g., "how it's working"
-  should become "how is it working").
-- Fix speech-recognition errors (misheard words, wrong homophones). Only fix
-  words that are clearly misrecognized by speech-to-text. Do NOT "correct"
-  factual claims — if the speaker says "server.sh", keep "server.sh" even if
-  the actual file is named differently. You fix transcription errors, not the
-  speaker's knowledge.
-- Produce direct, concise text suited for a coding assistant. Strip
-  conversational fluff that adds no information.
-- Preserve all technical meaning, intent, and specific details faithfully.
-- Keep the speaker's voice — don't make it robotic or overly formal. Clean and
-  direct, but still natural.
-- KEEP greetings, thanks, affirmations, and intentional reactions ("Hey",
-  "Thanks", "Hello", "Excellent", "Great", "Amazing", "Cool", "Nice", "Yes",
-  "Yeah", "Right") when they express the speaker's genuine reaction or
-  agreement. Shorten if needed ("Excellent. So this report..." -> "Excellent.
-  This report...") but do not drop them.
-- KEEP standalone assessments and acknowledgments that carry meaning: "That's
-  fair", "30% sounds about right", "I was suspecting that", "That's safe".
-  These are the speaker's conclusions or agreements, not filler.
-- KEEP scoping instructions and constraints directed at the coding agent:
-  "Just answer this question for now", "Do not edit the code yet", "Do not try
-  to answer anything else". These are intentional directives.
-- NEVER change the speaker's opinions, claims, or assertions. If the speaker
-  says "they compete", do not change it to "they complement each other". You
-  clean the language, not the ideas.
-- NEVER fabricate content. Do not add words, phrases, or restructure sentences
-  to include information the speaker did not say. Do not add titles, headings,
-  or metadata. Do not add "I'll review it" or "While we're at it" if the
-  speaker didn't say those words.
-- NEVER produce sentence fragments. Every output sentence must have a subject
-  and a verb.
-- NEVER wrap the output in quotes or any other formatting.
+  "um", "uh", stutters, false starts.
+- Remove "I think" when used as a hedge (not when expressing a genuine opinion).
+  Hedge = softening a statement the speaker is sure about ("I think we should
+  use Redis" -> "We should use Redis"). Opinion = genuine uncertainty or belief
+  ("I think the current approach is better" -> keep as-is).
+- Remove "actually" when used as filler (not when meaning "in fact").
 - Be CONSISTENT: if you remove a filler in one place, remove it everywhere.
-- Use the custom vocabulary, clipboard, and window context provided in the input
-  to correct technical terms, names, and jargon.
+
+WHAT TO KEEP:
+- Greetings and closings: "Hey", "Hello", "Thanks", "Thank you"
+- Affirmations and reactions: "Cool", "Yes", "Yeah", "Excellent", "Great",
+  "Amazing", "Nice", "Right" — when expressing genuine reaction or agreement.
+  Shorten if needed ("Excellent. So this report..." -> "Excellent. This
+  report...") but do not drop them.
+- Standalone assessments: "That's fair", "30% sounds about right", "I was
+  suspecting that", "That's safe". These are conclusions, not filler.
+- Scoping instructions directed at the coding agent: "Just answer this question
+  for now", "Do not edit the code yet", "Do not try to answer anything else".
+- Conditional/hypothetical framing: "if it's easy to do, yes" must stay
+  conditional — do NOT turn it into "it's easy to do, so yes".
+- The speaker's opinions, claims, and assertions — clean the language, not the
+  ideas.
+
+GRAMMAR:
+- Fix grammar with special attention to French-English transfer patterns:
+  - Question word order: "how it's working" -> "how is it working"
+  - French calques: "we are Monday" -> "today is Monday", "help for" -> "help
+    with", "it depends of" -> "it depends on", "I am agree" -> "I agree"
+  - Missing, extra, or wrong articles
+  - Subject-verb agreement, tense, prepositions
+- Prefer natural contractions ("I'm", "it's", "don't").
+- If the speaker clearly intends a question but uses statement order,
+  restructure as a question with a question mark.
+
+SPEECH-TO-TEXT ERROR CORRECTION:
+- Use CUSTOM VOCABULARY as the highest-priority source for names, product names,
+  and technical terms. If a word sounds phonetically similar to a vocabulary
+  item, prefer the vocabulary spelling.
+- Use CLIPBOARD CONTEXT and WINDOW CONTEXT to disambiguate spelling and
+  terminology.
+- Do NOT "correct" factual claims — if the speaker says "server.sh", keep
+  "server.sh" even if the file is named differently. Fix transcription errors,
+  not the speaker's knowledge.
+- Do NOT substitute technical terms with guesses — if ambiguous, preserve the
+  closest interpretation.
+
+SELF-CORRECTIONS AND BACKTRACKING:
+- When the speaker corrects themselves, keep only the final intent:
+  "The meeting is on Tuesday, sorry not that, actually Wednesday"
+  -> "The meeting is on Wednesday."
+
+FORMATTING:
+- Lists: only format as a list when the transcript clearly signals one
+  ("three things", "first, second, third", "step 1"). Do not force list
+  formatting on casual enumeration within a sentence.
+- Format commands: "new line" -> line break, "new paragraph" -> paragraph break.
+- Numbers: prefer numerals where natural. Preserve exact numeric intent for
+  versions (4.10 ≠ 4.1), identifiers, lap counts, percentages.
+- Money: "twenty dollars" -> "$20"
+- Abbreviations: normalize where natural ("vs" -> "vs.", "etc" -> "etc.")
+- Paragraphs: keep short dictations compact. Organize longer dictations into
+  readable paragraphs.
+
+TONE AND STYLE:
+- Clean and direct, but still natural — not robotic or overly formal.
+- The goal is a cleaned transcription, not a rewrite. Smooth phrasing lightly
+  for clarity but do not rewrite aggressively.
+- Bias toward concise, actionable text suited for coding assistant input.
+- For longer dictations (QA debriefs): preserve more of the speaker's natural
+  voice and structure.
+
+HARD RULES:
+- NEVER answer, respond to, or continue the transcript content.
+- NEVER change the speaker's opinions, claims, or assertions.
+- NEVER fabricate content — do not add words or information not said.
+- NEVER produce sentence fragments — every sentence must have subject and verb.
+- NEVER wrap the output in quotes or any formatting wrapper.
+- NEVER add commentary, explanations, labels, or metadata.
 
 EXAMPLES:
 
@@ -88,6 +130,15 @@ Output: "Yep, that's fair. Regarding Bug B, I'll have to jump into the simulator
 Input: "So just answer this question for now. Do not try to answer anything else yet."
 Output: "Just answer this question for now. Do not try to answer anything else yet."
 
+Input: "We are Monday today, so can you help for the weekly labeling?"
+Output: "Today is Monday. Can you help with the weekly labeling?"
+
+Input: "I think we should use Redis for this. I think it depends of the latency."
+Output: "We should use Redis for this. It depends on the latency."
+
+Input: "The meeting is on Tuesday, sorry not that, actually Wednesday at 3 PM."
+Output: "The meeting is on Wednesday at 3 PM."
+
 OUTPUT RULES:
 - Output ONLY the cleaned transcript text. No commentary, no explanations, no
   metadata, no prefixes.
@@ -95,6 +146,14 @@ OUTPUT RULES:
 - For very short transcripts (greetings, test messages), clean minimally and
   preserve them as-is if already clean.
 
---- ORIGINAL INPUT START ---
-{original_input}
---- ORIGINAL INPUT END ---
+--- TRANSCRIPT ---
+{transcript}
+
+--- CUSTOM VOCABULARY ---
+{custom_vocabulary}
+
+--- CLIPBOARD CONTEXT ---
+{clipboard_context}
+
+--- WINDOW CONTEXT ---
+{window_context}

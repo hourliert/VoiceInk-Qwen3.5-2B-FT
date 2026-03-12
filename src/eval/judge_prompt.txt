@@ -10,20 +10,38 @@ IMPORTANT RULES:
 
 CONTEXT:
 - The speaker is a non-native English speaker (French) who dictates to coding
-  assistants (Claude Code, Codex). Transcripts should be cleaned for input to
-  these tools.
-- Custom vocabulary: Alien, brake, brake point, chicane, Claude, Claude Code,
-  cron, cue, Electron, GT Coach, json, OpenClaw, prompt, supabase, unsloth,
-  VoiceInk.
+  assistants (Claude Code, Codex) and for QA debriefs (GT Coach, a sim-racing
+  coaching app).
+- Custom vocabulary for this sample (use for technical_accuracy scoring):
+  {custom_vocabulary}
+
+DISAMBIGUATION:
+- Filler removal and meaning preservation can overlap. When a model removes
+  words that are fillers (e.g., "so", "like", "basically", "I think" as hedge),
+  score filler_removal for how well it cleaned them AND score
+  meaning_preservation based on whether substantive content was preserved.
+  Do NOT double-penalize: if a filler removal does not change the speaker's
+  intended message, do not lower meaning_preservation.
+- When the gold standard removes a word/phrase, that removal is considered
+  correct. If an output keeps unnecessary content, it may lose on filler_removal
+  or conciseness, but should not gain on meaning_preservation just for keeping
+  filler.
 
 RUBRIC (score each dimension 1-5 for each output):
 
 1. MEANING_PRESERVATION (weight: 3x) -- Critical
    5 = Perfect meaning preservation, no additions or omissions
-   4 = Trivially different phrasing, no meaning change
-   3 = Minor meaning shift (dropped qualifier, softened assertion)
-   2 = Noticeable meaning change (dropped clause, changed opinion)
-   1 = Major meaning distortion or hallucinated content
+   4 = Trivially different phrasing, no meaning change. Includes: dropped/added
+       articles, minor pronoun changes, reordered clauses with same meaning,
+       removing filler phrases like "I think" or "you know" that don't carry
+       substantive meaning in context.
+   3 = Minor meaning shift: a qualifier is dropped that slightly changes tone
+       (e.g., "probably" removed), or a hedged statement becomes assertive,
+       or a conditional is flattened.
+   2 = Noticeable meaning change: an entire clause or sentence is dropped,
+       a factual claim is altered, or the speaker's opinion is changed.
+   1 = Major meaning distortion or hallucinated content not present in the
+       raw transcript.
 
 2. FILLER_REMOVAL (weight: 2x)
    5 = All fillers removed, no meaningful content lost
@@ -33,14 +51,18 @@ RUBRIC (score each dimension 1-5 for each output):
    1 = No cleanup or aggressive meaning-altering removal
 
 3. GRAMMAR_FLUENCY (weight: 2x)
-   5 = Native-level grammar, natural flow
-   4 = Minor imperfection that doesn't affect clarity
-   3 = Noticeable grammar issue (wrong article, awkward phrasing)
-   2 = Multiple grammar errors
+   5 = Native-level grammar, natural flow. Non-native patterns corrected
+       (e.g., "we are Monday" -> "it's Monday", "how it's working" ->
+       "how is it working", missing/wrong articles fixed).
+   4 = Minor imperfection that doesn't affect clarity (e.g., one missing
+       article, slightly awkward but understandable phrasing)
+   3 = Noticeable grammar issue or uncorrected non-native phrasing that
+       a native speaker would notice
+   2 = Multiple grammar errors or several uncorrected non-native patterns
    1 = Broken grammar, hard to read
 
 4. TECHNICAL_ACCURACY (weight: 2x)
-   5 = All technical terms, names, numbers correct
+   5 = All technical terms, names, numbers correct per custom vocabulary
    4 = One minor miss (e.g., casing)
    3 = One substantive error (wrong term spelling)
    2 = Multiple errors in technical content
@@ -54,11 +76,19 @@ RUBRIC (score each dimension 1-5 for each output):
    1 = No cleanup of verbosity
 
 6. INSTRUCTION_FOLLOWING (weight: 3x) -- Critical
-   5 = Perfect role adherence, clean output only
-   4 = Trivial format issue (extra whitespace, quotes)
-   3 = Minor role break (added a brief note)
-   2 = Partial role break (answered part of a question)
-   1 = Complete role failure (answered the question, added commentary)
+   5 = Perfect role adherence: outputs only the cleaned transcript text, no
+       wrapper, no prefix, no commentary, no quotes around the output
+   4 = Trivial format issue (extra whitespace, trailing newline)
+   3 = Minor role break: added a brief note, a "Cleaned:" prefix, or wrapped
+       the output in quotation marks
+   2 = Partial role break: answered part of a question from the transcript,
+       or added commentary about changes made
+   1 = Complete role failure: answered the question, followed instructions
+       from the transcript, or added substantial non-transcript content
+
+An output that returns the raw transcript unchanged should score high on
+meaning_preservation but low on filler_removal, grammar_fluency, and
+conciseness.
 
 RAW TRANSCRIPT:
 {raw_transcript}

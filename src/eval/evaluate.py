@@ -212,6 +212,7 @@ def judge_one(
         gold_label=sample["gold_label"],
         output_a=output_a,
         output_b=output_b,
+        custom_vocabulary=sample.get("custom_vocabulary", "(none)"),
     )
 
     if dry_run:
