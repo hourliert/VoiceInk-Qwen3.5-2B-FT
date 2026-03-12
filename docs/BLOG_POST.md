@@ -381,11 +381,11 @@ The per-dimension scores reveal where fine-tuning makes the difference:
 | Dimension | Weight | FT 2B | Baselines | Gap |
 |---|---|---|---|---|
 | Meaning preservation | 3x | 4.24–4.28 | 4.20–4.37 | ~0 |
-| Instruction following | 3x | 4.94–4.96 | 4.78–4.96 | small |
-| **Filler removal** | 2x | **4.37–4.43** | 2.68–3.22 | **+1.3** |
+| Instruction following | 3x | 4.94–4.96 | 4.78–4.96 | +0.1 |
+| **Filler removal** | 2x | **4.37–4.43** | 2.68–3.22 | **+1.4** |
 | **Grammar/fluency** | 2x | **4.57–4.65** | 3.71–4.25 | **+0.6** |
 | Technical accuracy | 2x | 4.61–4.67 | 4.27–4.56 | +0.2 |
-| **Conciseness** | 1x | **4.42–4.45** | 2.90–3.43 | **+1.2** |
+| **Conciseness** | 1x | **4.42–4.45** | 2.90–3.43 | **+1.3** |
 
 Meaning preservation and instruction following are near-ceiling for all models — the base Qwen 3.5 architecture handles these well out of the box. The gap is entirely in filler removal, grammar, and conciseness: the exact behaviors that require task-specific training data to learn. No amount of prompt engineering gets a base model from 2.68 to 4.40 on filler removal.
 
