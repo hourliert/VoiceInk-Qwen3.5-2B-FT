@@ -24,11 +24,17 @@ Here's what that looks like in practice — real samples from the training data,
 
 Fillers removed ("so", "actually"), STT misrecognitions fixed ("Voice Inc." → "VoiceInk", "QEN 3.5 Forbi" → "Qwen 3.5 4B").
 
-> **Raw:** Wait, I I'm sure we do instantiate yourself with my cloud code tokens during CI, for instance, on another project.
+> **Raw:** the Allian lab shows a much later breakpoint into term three.
 >
-> **Cleaned:** I'm sure we do instantiate you with my Claude Code tokens during CI, for instance on another project.
+> **Cleaned:** The alien lap shows a much later brake point into turn 3.
 
-Stutter removed ("Wait, I I'm" → "I'm"), phonetic STT error fixed ("cloud code" → "Claude Code").
+Four STT errors in eleven words: "Allian" → "alien", "lab" → "lap", "breakpoint" → "brake point", "term three" → "turn 3".
+
+> **Raw:** The breakpoint for chicken 17 is about 50 meters before the entry.
+>
+> **Cleaned:** The brake point for chicane 17 is about 50 meters before the entry.
+
+Domain-specific phonetic corrections: "breakpoint" → "brake point", "chicken" → "chicane".
 
 > **Raw:** So I think the correct fix is probably there's two fixes we need to do. One is we need to mutate locally this reference package, which I believe is a binary file with like the prefixes, some kind of like metadata to switch from monza to monza node chicain
 >
