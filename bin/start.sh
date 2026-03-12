@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly ROUTER_ROOT=/home/thomas/srv/llama-router
+readonly ROUTER_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+readonly LLAMA_SERVER="${LLAMA_SERVER:-/home/thomas/llama.cpp/llama-server}"
 readonly LLAMA_HOST=127.0.0.1
 readonly LLAMA_PORT=8002
 readonly PROXY_HOST=0.0.0.0
@@ -21,7 +22,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-/home/thomas/llama.cpp/llama-server \
+"${LLAMA_SERVER}" \
   --host "${LLAMA_HOST}" \
   --port "${LLAMA_PORT}" \
   --parallel 1 \

@@ -34,5 +34,5 @@ Training data is being collected via the proxy's JSONL logs (`logs/voiceink_prox
 ## Development notes
 
 - Python scripts use only the standard library (no pip dependencies).
-- The llama.cpp binary lives at `/home/thomas/llama.cpp/llama-server` (outside this repo).
+- The llama.cpp binary path is configured via the `LLAMA_SERVER` environment variable (defaults to `/home/thomas/llama.cpp/llama-server`).
 - VoiceInk on the Mac is already configured to send requests to this PC's IP on port 8001.
