@@ -95,6 +95,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:
         return
 
+    # Stop sequences injected into every chat completion request.
+    # Prevents Qwen 3.5 thinking-mode leakage when thinking is disabled.
+    INJECTED_STOP_TOKENS = ["</think>"]
+
     def _proxy(self) -> None:
         started = time.perf_counter()
         request_id = str(uuid.uuid4())
@@ -104,6 +108,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if content_length:
             request_body = self.rfile.read(int(content_length))
 
+        # Inject stop tokens into chat completion requests
+        if self.path == "/v1/chat/completions" and request_body:
+            request_json = try_parse_json(decode_body(request_body))
+            if isinstance(request_json, dict):
+                existing = request_json.get("stop") or []
+                if isinstance(existing, str):
+                    existing = [existing]
+                merged = list(dict.fromkeys(existing + self.INJECTED_STOP_TOKENS))
+                request_json["stop"] = merged
+                request_body = json.dumps(request_json, ensure_ascii=False).encode("utf-8")
+
         backend_headers = {}
         for key, value in self.headers.items():
             if key.lower() in HOP_BY_HOP_HEADERS:
@@ -112,6 +127,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 backend_headers[key] = f"{self.server.backend_host}:{self.server.backend_port}"
             else:
                 backend_headers[key] = value
+        # Update Content-Length after potential body modification
+        if request_body:
+            backend_headers["Content-Length"] = str(len(request_body))
 
         backend = http.client.HTTPConnection(
             self.server.backend_host,
