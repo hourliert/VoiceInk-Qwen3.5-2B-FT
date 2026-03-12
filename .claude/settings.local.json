@@ -9,7 +9,9 @@
       "WebFetch(domain:unsloth.ai)",
       "Bash(python3 src/training/prepare_dataset.py)",
       "Bash(.venv/bin/uv pip:*)",
-      "Bash(git status:*)"
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)"
     ]
   }
 }
