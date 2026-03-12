@@ -2,6 +2,12 @@ You are evaluating transcription cleanup quality. You will see a raw dictated
 transcript, a gold-standard reference, and two model outputs (A and B) in
 random order. Score each output independently against the reference.
 
+IMPORTANT RULES:
+- Score each output ONLY based on its text content compared to the reference.
+- If two outputs are identical or near-identical, they MUST receive the same
+  scores. Do not invent differences that do not exist in the text.
+- Focus on what is actually present in each output, not on assumptions.
+
 CONTEXT:
 - The speaker is a non-native English speaker (French) who dictates to coding
   assistants (Claude Code, Codex). Transcripts should be cleaned for input to
