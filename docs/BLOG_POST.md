@@ -36,10 +36,13 @@ The 2B was fast but terrible at following the cleanup instructions. And across a
 
 That's when I built a lightweight Python reverse proxy ([`src/voiceink_proxy/server.py`](../src/voiceink_proxy/server.py)) that sits between VoiceInk and llama-server. It forwards every request transparently and logs the complete request/response pair as JSONL — the raw Parakeet transcript, the system prompt, the custom vocabulary, clipboard context, window context, the model's cleaned output, latency, everything.
 
-```
-VoiceInk (Mac) → Proxy (port 8001) → llama-server (port 8002)
-                     ↓
-              logs/voiceink_proxy_requests.jsonl
+```mermaid
+graph LR
+    V["VoiceInk (Mac)"] -->|"HTTP request"| P["Reverse Proxy<br/>port 8001"]
+    P -->|"forward"| L["llama-server<br/>port 8002"]
+    L -->|"cleaned text"| P
+    P -->|"response"| V
+    P -.->|"log"| J["logs/requests.jsonl"]
 ```
 
 This turned out to be the single most important decision in the project. Every dictation I did from that point on was automatically collected as training data. Over a thousand real-world samples, passively, with zero annotation effort.
@@ -75,6 +78,19 @@ That's when I decided to fine-tune.
 ## The Fine-Tuning Pipeline
 
 The pipeline has four stages, each built as a standalone Python script:
+
+```mermaid
+graph TD
+    A["Proxy Logs<br/>1,175 real requests"] --> B["Label with Claude<br/>(LLM-as-judge)"]
+    B --> C["datasets/labeled.jsonl"]
+    S["Synthetic Generator<br/>(Claude Sonnet 4.6)"] --> SD["datasets/synthetic/labeled.jsonl"]
+    C --> P["Prepare Dataset"]
+    SD --> P
+    P --> T["Fine-tune with Unsloth<br/>(LoRA on RTX 4080 Super)"]
+    T --> G["GGUF Model"]
+    G --> EV["A/B Evaluation<br/>(Claude as judge)"]
+    EV -.->|"iterate"| B
+```
 
 ### 1. Labeling ([`src/labeling/label.py`](../src/labeling/label.py))
 
@@ -159,6 +175,18 @@ The evaluation pipeline had its own bugs to work through:
 
 ## Training Iterations
 
+```mermaid
+graph LR
+    V1["<b>v1–v2</b><br/>90→400 samples<br/>Loss 2.22→0.56<br/>seq_length bug fixed"]
+    V3["<b>v3</b><br/>1,175 relabeled<br/>New judge prompt<br/><b>89.8</b> vs 84.0"]
+    V4["<b>v4</b><br/>Completions-only<br/>Loss 0.85→0.15<br/><b>92.1</b> vs 84.0"]
+    V5["<b>v5</b><br/>+120 synthetic<br/>Long QA fixed<br/><b>91.6</b> + stop"]
+    V1 --> V3 --> V4 -->|"production bug"| V5
+
+    style V4 fill:#d4edda,stroke:#28a745
+    style V5 fill:#d4edda,stroke:#28a745
+```
+
 ### v1–v2: Getting the Foundations Right
 
 The first training run used 90 labeled samples, 3 epochs, LoRA rank 16, and default hyperparameters. Loss dropped from 2.22 to 0.56 — the model learned the general shape of the task. But there was a configuration bug: `max_seq_length` was set to 16384 in the script, but never passed to `FastVisionModel.from_pretrained()`. Unsloth silently defaulted to 2048. The model had never seen a full-length VoiceInk prompt during training — the system prompt alone is over 2,000 tokens.
@@ -210,6 +238,16 @@ The model produced **7,215 words of output from a 3,266-word input**. It hit the
 The coaching app naturally says similar things each lap: "Corner 2, brake one beat earlier. It carried into corner 3. Your mid-corner speed is down." These phrases repeat because the driver makes similar mistakes each lap. A 6-lap session might have the same corner advice appearing 6-8 times — that's correct and should be preserved.
 
 The model was amplifying this repetition. Where the input had a phrase 7 times, the output had it 16 times. Each repetitive token made the next one more likely, creating a positive feedback loop that filled the entire context window.
+
+```mermaid
+graph LR
+    A["Input: coaching phrase<br/>repeated 7×"] --> B["Model generates<br/>repetitive tokens"]
+    B --> C["Each repetition boosts<br/>probability of the next"]
+    C --> B
+    C --> D["Output: same phrase 16×<br/>7,215 words — hit 16K ceiling"]
+
+    style D fill:#f8d7da,stroke:#dc3545
+```
 
 ### Debugging
 
