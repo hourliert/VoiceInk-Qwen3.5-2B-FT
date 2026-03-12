@@ -222,6 +222,25 @@ def main() -> None:
         # that produces the final directory we want.
         gguf_base = DEFAULT_GGUF_DIR / "Qwen3.5-2B-voiceink"
         gguf_final = Path(str(gguf_base) + "_gguf")
+
+        # Back up existing GGUF files before overwriting (v1, v2, v3, ...)
+        if gguf_final.exists():
+            for gguf_file in sorted(gguf_final.glob("*.gguf")):
+                if ".v" in gguf_file.stem or gguf_file.name.startswith("Qwen3.5-2B.BF16"):
+                    continue
+                # Find next version number
+                existing_versions = sorted(gguf_final.glob(f"{gguf_file.stem}.v*.gguf"))
+                next_v = 1
+                for v_file in existing_versions:
+                    try:
+                        n = int(v_file.stem.rsplit(".v", 1)[1])
+                        next_v = max(next_v, n + 1)
+                    except (ValueError, IndexError):
+                        pass
+                backup = gguf_file.with_name(f"{gguf_file.stem}.v{next_v}.gguf")
+                print(f"\nBacking up {gguf_file.name} -> {backup.name}")
+                shutil.copy2(gguf_file, backup)
+
         print(f"\nExporting to GGUF ({', '.join(quant_methods)}) -> {gguf_final}")
         model.save_pretrained_gguf(
             str(gguf_base),
