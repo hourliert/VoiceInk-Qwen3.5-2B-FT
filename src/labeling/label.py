@@ -117,29 +117,7 @@ class LabeledDataset:
             return len(self._records)
 
 
-def extract_original_input(record: dict) -> str | None:
-    """Extract the full original VoiceInk input (system + user messages).
-
-    Legacy method — kept for backward compatibility. Prefer
-    extract_from_record() for structured access.
-    """
-    try:
-        req = json.loads(record["raw_request_json"])
-    except (json.JSONDecodeError, KeyError):
-        return None
-
-    messages = req.get("messages", [])
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role in ("system", "user") and content:
-            parts.append(f"[{role.upper()}]\n{content}")
-
-    return "\n\n".join(parts) if parts else None
-
-
-def build_prompt(record: dict) -> str | None:
+def build_prompt(record: dict, judge_template: str) -> str | None:
     """Build the judge prompt with structured context from a record.
 
     Extracts transcript, vocabulary, clipboard, and window context
@@ -153,15 +131,6 @@ def build_prompt(record: dict) -> str | None:
 
     if not components["transcript"]:
         return None
-
-    judge_template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
-
-    # Support both old-style {original_input} and new-style structured placeholders
-    if "{original_input}" in judge_template:
-        original_input = extract_original_input(record)
-        if original_input is None:
-            return None
-        return judge_template.format(original_input=original_input)
 
     return judge_template.format(
         transcript=components["transcript"],
@@ -192,9 +161,9 @@ def call_claude(prompt: str, model: str) -> str:
     return result.stdout.strip()
 
 
-def label_one(record: dict, model: str, dry_run: bool) -> dict | None:
+def label_one(record: dict, model: str, dry_run: bool, judge_template: str) -> dict | None:
     """Label a single record. Returns the labeled record or None on failure."""
-    prompt = build_prompt(record)
+    prompt = build_prompt(record, judge_template)
     if prompt is None:
         return None
 
@@ -265,13 +234,16 @@ def main() -> None:
         print("Nothing to label.")
         return
 
+    # Read template once, pass to all workers
+    judge_template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
+
     labeled_count = 0
     error_count = 0
 
     if args.parallel <= 1:
         for i, record in enumerate(to_label, 1):
             print(f"[{i}/{len(to_label)}] Labeling {record['request_id']}...")
-            result = label_one(record, args.model, args.dry_run)
+            result = label_one(record, args.model, args.dry_run, judge_template)
             if result:
                 dataset.save(result)
                 labeled_count += 1
@@ -280,7 +252,7 @@ def main() -> None:
     else:
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
             futures = {
-                pool.submit(label_one, record, args.model, args.dry_run): record
+                pool.submit(label_one, record, args.model, args.dry_run, judge_template): record
                 for record in to_label
             }
             for i, future in enumerate(as_completed(futures), 1):

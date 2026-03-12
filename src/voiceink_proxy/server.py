@@ -108,16 +108,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if content_length:
             request_body = self.rfile.read(int(content_length))
 
+        # Decode and parse request body once for both stop-token injection and logging
+        raw_request = decode_body(request_body) if request_body else ""
+        request_json = try_parse_json(raw_request) if raw_request else None
+
         # Inject stop tokens into chat completion requests
-        if self.path == "/v1/chat/completions" and request_body:
-            request_json = try_parse_json(decode_body(request_body))
-            if isinstance(request_json, dict):
-                existing = request_json.get("stop") or []
-                if isinstance(existing, str):
-                    existing = [existing]
-                merged = list(dict.fromkeys(existing + self.INJECTED_STOP_TOKENS))
-                request_json["stop"] = merged
-                request_body = json.dumps(request_json, ensure_ascii=False).encode("utf-8")
+        if self.path == "/v1/chat/completions" and isinstance(request_json, dict):
+            existing = request_json.get("stop") or []
+            if isinstance(existing, str):
+                existing = [existing]
+            merged = list(dict.fromkeys(existing + self.INJECTED_STOP_TOKENS))
+            request_json["stop"] = merged
+            request_body = json.dumps(request_json, ensure_ascii=False).encode("utf-8")
+            raw_request = decode_body(request_body)
 
         backend_headers = {}
         for key, value in self.headers.items():
@@ -180,9 +183,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(response_body)
 
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
-        raw_request = decode_body(request_body)
         raw_response = decode_body(response_body)
-        request_json = try_parse_json(raw_request)
         response_json = try_parse_json(raw_response)
 
         self.server.logger.write(
@@ -235,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend-timeout", type=float, default=300.0)
     parser.add_argument(
         "--log-file",
-        default="/home/thomas/srv/llama-router/logs/voiceink_proxy_requests.jsonl",
+        default=str(Path(__file__).resolve().parents[2] / "logs" / "voiceink_proxy_requests.jsonl"),
     )
     return parser.parse_args()
 

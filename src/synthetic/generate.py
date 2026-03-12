@@ -96,9 +96,8 @@ def build_scenario_matrix(count: int) -> list[dict]:
     return assignments
 
 
-def build_prompt(assignment: dict) -> str:
+def build_prompt(assignment: dict, template: str) -> str:
     """Build the generator prompt for a specific assignment."""
-    template = GENERATOR_PROMPT_PATH.read_text(encoding="utf-8")
     return template.format(
         track=assignment["track"],
         scenario=assignment["scenario"],
@@ -139,9 +138,8 @@ def parse_response(response: str) -> tuple[str, str]:
     return raw_match.group(1).strip(), clean_match.group(1).strip()
 
 
-def build_raw_request_json(transcript: str, window_context: str) -> str:
+def build_raw_request_json(transcript: str, window_context: str, voiceink_prompt: str) -> str:
     """Construct a valid VoiceInk-format raw_request_json envelope."""
-    voiceink_prompt = VOICEINK_PROMPT_PATH.read_text(encoding="utf-8").strip()
 
     system_content = (
         f"{voiceink_prompt}\n\n"
@@ -165,9 +163,10 @@ def build_raw_request_json(transcript: str, window_context: str) -> str:
     return json.dumps(request, ensure_ascii=False)
 
 
-def generate_one(assignment: dict, model: str, dry_run: bool) -> dict | None:
-    """Generate a single synthetic sample. Returns a labeled record or None."""
-    prompt = build_prompt(assignment)
+def generate_one(assignment: dict, model: str, dry_run: bool,
+                 generator_template: str, voiceink_prompt: str) -> tuple[dict, int, int] | None:
+    """Generate a single synthetic sample. Returns (record, raw_words, clean_words) or None."""
+    prompt = build_prompt(assignment, generator_template)
     idx = assignment["index"]
 
     if dry_run:
@@ -196,7 +195,7 @@ def generate_one(assignment: dict, model: str, dry_run: bool) -> dict | None:
         "timestamp": datetime.now().isoformat(),
         "model_used_for_label": model,
         "original_model": "synthetic",
-        "raw_request_json": build_raw_request_json(raw_transcript, window_ctx),
+        "raw_request_json": build_raw_request_json(raw_transcript, window_ctx, voiceink_prompt),
         "original_response": "",
         "label": clean_transcript,
     }
@@ -258,6 +257,10 @@ def main() -> None:
         print(f"VoiceInk prompt not found: {VOICEINK_PROMPT_PATH}", file=sys.stderr)
         sys.exit(1)
 
+    # Read templates once
+    generator_template = GENERATOR_PROMPT_PATH.read_text(encoding="utf-8")
+    voiceink_prompt = VOICEINK_PROMPT_PATH.read_text(encoding="utf-8").strip()
+
     dataset = SyntheticDataset(args.output)
     existing = dataset.existing_ids()
 
@@ -282,7 +285,8 @@ def main() -> None:
     errors = 0
 
     def process(assignment):
-        return generate_one(assignment, args.model, args.dry_run)
+        return generate_one(assignment, args.model, args.dry_run,
+                           generator_template, voiceink_prompt)
 
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = {executor.submit(process, a): a for a in todo}

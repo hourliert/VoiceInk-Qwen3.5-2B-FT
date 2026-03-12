@@ -23,7 +23,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from common.extract import extract_components
 DEFAULT_EVAL = ROOT / "datasets" / "eval.jsonl"
 DEFAULT_OUTPUT_DIR = ROOT / "results"
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "judge_prompt.txt"
@@ -193,6 +192,7 @@ def judge_one(
     judge_model: str,
     dry_run: bool,
     seed_offset: int,
+    judge_template: str,
 ) -> dict | None:
     """Judge a single sample. Returns structured result or None on failure."""
     rng = random.Random(42 + seed_offset)
@@ -205,8 +205,7 @@ def judge_one(
         output_a, output_b = candidate_text, baseline_text
         a_is = "candidate"
 
-    template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
-    prompt = template.format(
+    prompt = judge_template.format(
         raw_transcript=sample["raw_transcript"],
         gold_label=sample["gold_label"],
         output_a=output_a,
@@ -525,6 +524,7 @@ def main() -> None:
             candidate_outputs[i] = c_outs[j]
 
         # Judge uncached pairs
+        judge_template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
         print(f"\nJudging {len(uncached_indices)} new outputs ({args.judge_model})...")
         errors = 0
 
@@ -533,7 +533,8 @@ def main() -> None:
                 print(f"  [{j+1}/{len(uncached_indices)}]", end=" ")
                 result = judge_one(samples[i], baseline_outputs[i]["text"],
                                   candidate_outputs[i]["text"],
-                                  args.judge_model, args.dry_run, i)
+                                  args.judge_model, args.dry_run, i,
+                                  judge_template)
                 judge_results[i] = result
                 if not result:
                     errors += 1
@@ -544,7 +545,8 @@ def main() -> None:
                     fut = pool.submit(judge_one, samples[i],
                                       baseline_outputs[i]["text"],
                                       candidate_outputs[i]["text"],
-                                      args.judge_model, False, i)
+                                      args.judge_model, False, i,
+                                      judge_template)
                     futures[fut] = i
 
                 done_count = 0

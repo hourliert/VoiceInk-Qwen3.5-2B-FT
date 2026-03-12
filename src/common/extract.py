@@ -29,7 +29,6 @@ def extract_components(raw_request_json: str) -> dict:
         system_prompt       - the VoiceInk prompt (from <SYSTEM_INSTRUCTIONS>)
         model               - model field from request
         temperature         - temperature from request
-        max_tokens          - max_tokens from request
     """
     req = json.loads(raw_request_json)
     messages = req.get("messages", [])
@@ -68,7 +67,6 @@ def extract_components(raw_request_json: str) -> dict:
         "system_prompt": system_prompt,
         "model": req.get("model", ""),
         "temperature": req.get("temperature", 0.3),
-        "max_tokens": req.get("max_tokens", 256),
     }
 
 
