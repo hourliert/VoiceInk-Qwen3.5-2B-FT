@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+from common.extract import extract_from_record
 DEFAULT_INPUT = ROOT / "logs" / "voiceink_proxy_requests.jsonl"
 DEFAULT_OUTPUT = ROOT / "datasets" / "labeled.jsonl"
 DEFAULT_MODEL = "claude-sonnet-4-6"
@@ -116,7 +118,11 @@ class LabeledDataset:
 
 
 def extract_original_input(record: dict) -> str | None:
-    """Extract the full original VoiceInk input (system + user messages)."""
+    """Extract the full original VoiceInk input (system + user messages).
+
+    Legacy method — kept for backward compatibility. Prefer
+    extract_from_record() for structured access.
+    """
     try:
         req = json.loads(record["raw_request_json"])
     except (json.JSONDecodeError, KeyError):
@@ -133,10 +139,36 @@ def extract_original_input(record: dict) -> str | None:
     return "\n\n".join(parts) if parts else None
 
 
-def build_prompt(original_input: str) -> str:
-    """Wrap the original VoiceInk input with the judge prompt."""
+def build_prompt(record: dict) -> str | None:
+    """Build the judge prompt with structured context from a record.
+
+    Extracts transcript, vocabulary, clipboard, and window context
+    from the record and passes them as separate placeholders to the
+    judge prompt template.
+    """
+    try:
+        components = extract_from_record(record)
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+    if not components["transcript"]:
+        return None
+
     judge_template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
-    return judge_template.format(original_input=original_input)
+
+    # Support both old-style {original_input} and new-style structured placeholders
+    if "{original_input}" in judge_template:
+        original_input = extract_original_input(record)
+        if original_input is None:
+            return None
+        return judge_template.format(original_input=original_input)
+
+    return judge_template.format(
+        transcript=components["transcript"],
+        custom_vocabulary=components["custom_vocabulary"] or "(none provided)",
+        clipboard_context=components["clipboard_context"] or "(empty)",
+        window_context=components["window_context"] or "(empty)",
+    )
 
 
 def call_claude(prompt: str, model: str) -> str:
@@ -162,11 +194,9 @@ def call_claude(prompt: str, model: str) -> str:
 
 def label_one(record: dict, model: str, dry_run: bool) -> dict | None:
     """Label a single record. Returns the labeled record or None on failure."""
-    original_input = extract_original_input(record)
-    if original_input is None:
+    prompt = build_prompt(record)
+    if prompt is None:
         return None
-
-    prompt = build_prompt(original_input)
 
     if dry_run:
         print(f"--- DRY RUN [{record['request_id']}] ---")

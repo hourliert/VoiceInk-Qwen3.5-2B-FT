@@ -17,9 +17,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+from common.extract import extract_from_record
+
 DEFAULT_INPUT = ROOT / "datasets" / "labeled.jsonl"
 DEFAULT_TRAIN_OUTPUT = ROOT / "datasets" / "train.jsonl"
 DEFAULT_EVAL_OUTPUT = ROOT / "datasets" / "eval.jsonl"
+DEFAULT_SYSTEM_PROMPT = ROOT / "docs" / "VOICEINK_PROMPT"
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,46 +38,66 @@ def parse_args() -> argparse.Namespace:
                    help="Fraction of data for eval set (default: 0.1)")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for train/eval split")
+    p.add_argument("--system-prompt", type=Path, default=DEFAULT_SYSTEM_PROMPT,
+                   help=f"System prompt file to use for training (default: {DEFAULT_SYSTEM_PROMPT})")
     return p.parse_args()
 
 
-def convert_record(record: dict) -> dict | None:
+def build_user_message(components: dict) -> str:
+    """Reconstruct the user message from extracted components."""
+    parts = []
+
+    if components["window_context"]:
+        parts.append(f"<CURRENT_WINDOW_CONTEXT>\n{components['window_context']}\n</CURRENT_WINDOW_CONTEXT>")
+
+    if components["clipboard_context"]:
+        parts.append(f"<CLIPBOARD_CONTEXT>\n{components['clipboard_context']}\n</CLIPBOARD_CONTEXT>")
+
+    if components["custom_vocabulary"]:
+        parts.append(f"<CUSTOM_VOCABULARY>\n{components['custom_vocabulary']}\n</CUSTOM_VOCABULARY>")
+
+    parts.append(f"<TRANSCRIPT>\n{components['transcript']}\n</TRANSCRIPT>")
+
+    return "\n\n".join(parts)
+
+
+def convert_record(record: dict, system_prompt: str) -> dict | None:
     """Convert a labeled record to chat messages format.
 
-    Takes the original VoiceInk messages as-is and appends the label as
-    the assistant response.
+    Extracts structured components from the original request, then
+    reconstructs messages using the provided system prompt. This
+    decouples training data from whatever prompt VoiceInk sent at
+    recording time.
+
+    Qwen 3.5 is a unified VLM, so content must be a list of typed blocks
+    (even for text-only input) to avoid the vision processor treating
+    plain strings as image paths.
     """
     try:
-        req = json.loads(record["raw_request_json"])
+        components = extract_from_record(record)
     except (json.JSONDecodeError, KeyError):
         return None
 
     label = record.get("label", "").strip()
-    if not label:
+    if not label or not components["transcript"]:
         return None
 
-    # Pass through the original messages exactly as VoiceInk sent them.
-    # Qwen 3.5 is a unified VLM, so content must be a list of typed blocks
-    # (even for text-only input) to avoid the vision processor treating
-    # plain strings as image paths.
-    messages = []
-    for msg in req.get("messages", []):
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role and content:
-            messages.append({
-                "role": role,
-                "content": [{"type": "text", "text": content}],
-            })
+    user_content = build_user_message(components)
 
-    if not messages:
-        return None
-
-    # Append the gold-standard label as the assistant response
-    messages.append({
-        "role": "assistant",
-        "content": [{"type": "text", "text": label}],
-    })
+    messages = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": system_prompt}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": user_content}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": label}],
+        },
+    ]
 
     return {"messages": messages}
 
@@ -99,11 +123,18 @@ def main() -> None:
 
     print(f"Loaded {len(records)} labeled records")
 
+    # Load system prompt
+    if not args.system_prompt.exists():
+        print(f"System prompt not found: {args.system_prompt}", file=sys.stderr)
+        sys.exit(1)
+    system_prompt = args.system_prompt.read_text(encoding="utf-8").strip()
+    print(f"Using system prompt from {args.system_prompt} ({len(system_prompt)} chars)")
+
     # Convert to training format
     converted = []
     skipped = 0
     for record in records:
-        result = convert_record(record)
+        result = convert_record(record, system_prompt)
         if result:
             converted.append(result)
         else:

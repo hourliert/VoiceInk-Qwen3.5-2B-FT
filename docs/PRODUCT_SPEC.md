@@ -3,7 +3,7 @@
 ## What this is
 
 A fine-tuned LLM that cleans up raw speech-to-text transcriptions from VoiceInk
-(a macOS dictation app). The speaker dictates into VoiceInk, which sends the raw
+(a macOS dictation app, using Parakeet V2 model). The speaker dictates into VoiceInk, which sends the raw
 transcript plus context to this model. The model returns a cleaned version.
 
 ## Who the speaker is
@@ -11,10 +11,10 @@ transcript plus context to this model. The model returns a cleaned version.
 - Non-native English speaker (French). Fluent in English but makes systematic
   L1 transfer errors (see Grammar section below).
 - Primary use case: dictating messages to coding assistants (Claude Code, Codex).
-- Secondary use case: general productivity (emails, notes, QA debriefs for
-  GT Coach, a sim-racing coaching app).
+- Secondary use case: general productivity (notes, QA debriefs for
+  GT Coach, a sim-racing coaching app - their main project).
 - Speaks directly and concisely when dictating to coding tools. More
-  conversational in QA debriefs and longer dictations.
+  conversational in QA debriefs and longer dictations (think as: recording in the background while QAing).
 
 ## What the model receives
 
@@ -93,12 +93,10 @@ Fix grammar issues, with special attention to French-English transfer patterns:
 ### Tone and style
 
 - Clean and direct, but still natural — not robotic or overly formal
-- Keep the speaker's register: informal stays informal, professional stays
-  professional
 - The goal is a cleaned transcription, not a rewrite. Smooth phrasing lightly
   for clarity but do not rewrite aggressively.
-- For coding assistant input: bias toward concise, actionable text
-- For longer dictations (QA debriefs, emails): preserve more of the speaker's
+- Bias toward concise, actionable text suited for coding assistant input
+- For longer dictations (QA debriefs): preserve more of the speaker's
   natural voice and structure
 
 ### Self-corrections and backtracking

@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+from common.extract import extract_components
 DEFAULT_EVAL = ROOT / "datasets" / "eval.jsonl"
 DEFAULT_OUTPUT_DIR = ROOT / "results"
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "judge_prompt.txt"
@@ -81,15 +83,19 @@ def load_eval_data(path: Path) -> list[dict]:
             user_text = msgs[1]["content"][0]["text"]
             gold_label = msgs[2]["content"][0]["text"]
 
-            # Extract raw transcript from <TRANSCRIPT> tags
+            # Extract raw transcript and vocabulary from user message
             m = re.search(r"<TRANSCRIPT>\s*(.*?)\s*</TRANSCRIPT>", user_text, re.DOTALL)
             raw_transcript = m.group(1).strip() if m else user_text.strip()
+
+            v = re.search(r"<CUSTOM_VOCABULARY>\s*(.*?)\s*</CUSTOM_VOCABULARY>", user_text, re.DOTALL)
+            custom_vocabulary = v.group(1).strip() if v else ""
 
             samples.append({
                 "system_text": system_text,
                 "user_text": user_text,
                 "gold_label": gold_label,
                 "raw_transcript": raw_transcript,
+                "custom_vocabulary": custom_vocabulary,
                 "messages_for_llama": [
                     {"role": "system", "content": system_text},
                     {"role": "user", "content": user_text},
