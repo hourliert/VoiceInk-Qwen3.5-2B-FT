@@ -85,6 +85,18 @@ The judge prompt encodes rules for:
 
 Output: `datasets/labeled.jsonl` — each record contains the original request, the model's original response, and Claude's gold-standard label. Dedup-safe by `request_id`.
 
+#### Label validation
+
+```bash
+python3 src/labeling/validate.py --parallel 10
+python3 src/labeling/validate.py --show-failures       # review flagged records
+python3 src/labeling/validate.py --force --parallel 10  # re-validate all
+```
+
+A lightweight quality gate that runs each label through **Claude Haiku 4.5** to check for meaning alteration, hallucination, over-deletion, repetition, or broken output. Results are written back into `labeled.jsonl` as a `validation` field on each record. Already-validated records are skipped unless `--force` is set.
+
+`prepare_dataset.py` automatically excludes records where `validation.status == "fail"` (override with `--include-failed`).
+
 ### 3. Synthetic data generation
 
 ```bash
@@ -106,6 +118,11 @@ Output: `datasets/synthetic/labeled.jsonl` — same schema as the real labels, w
 ### 4. Dataset preparation
 
 ```bash
+# Inspect the input length distribution (with optional synthetic overlay)
+python3 src/training/show_distribution.py
+python3 src/training/show_distribution.py --extra-input datasets/synthetic/labeled.jsonl
+
+# Convert to training format
 python3 src/training/prepare_dataset.py --extra-input datasets/synthetic/labeled.jsonl
 ```
 
@@ -223,10 +240,13 @@ src/
   labeling/
     label.py                     # Gold-standard label generation (Claude judge)
     judge_prompt.txt             # Labeling judge prompt
+    validate.py                  # Label quality validation (Haiku reviewer)
+    validate_prompt.txt          # Validation reviewer prompt
   synthetic/
     generate.py                  # Synthetic QA debrief generator
     generator_prompt.txt         # Generator prompt template
   training/
+    show_distribution.py         # Dataset distribution by input word count
     prepare_dataset.py           # Convert labels to training format
     finetune.py                  # Unsloth LoRA fine-tuning + GGUF export
   eval/
