@@ -1,0 +1,7 @@
+FROM ./models/Qwen3.5-2B-voiceink_gguf/Qwen3.5-2B.Q4_K_M.gguf
+
+PARAMETER temperature 0.7
+PARAMETER top_p 0.8
+PARAMETER top_k 20
+PARAMETER min_p 0.0
+PARAMETER num_ctx 16384
