@@ -28,12 +28,7 @@ DEFAULT_OUTPUT = ROOT / "datasets" / "synthetic" / "labeled.jsonl"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 GENERATOR_PROMPT_PATH = Path(__file__).resolve().parent / "generator_prompt.txt"
 VOICEINK_PROMPT_PATH = ROOT / "docs" / "VOICEINK_PROMPT"
-
-CUSTOM_VOCABULARY = (
-    "Important Vocabulary: Alien, brake, brake point, chicane, Claude, "
-    "Claude Code, cron, cue, Electron, GT Coach, json, OpenClaw, prompt, "
-    "supabase, unsloth, VoiceInk"
-)
+VOCABULARY_PATH = ROOT / "config" / "vocabulary.txt"
 
 TRACKS = [
     "Monza", "Dragon Trail", "Nürburgring", "Spa", "Suzuka",
@@ -109,6 +104,9 @@ def build_prompt(assignment: dict, template: str) -> str:
 def call_claude(prompt: str, model: str) -> str:
     """Call the Claude CLI and return the response text."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    env["CLAUDE_CODE_SKIP_UPDATE_CHECK"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
     result = subprocess.run(
         [
             "claude",
@@ -138,13 +136,14 @@ def parse_response(response: str) -> tuple[str, str]:
     return raw_match.group(1).strip(), clean_match.group(1).strip()
 
 
-def build_raw_request_json(transcript: str, window_context: str, voiceink_prompt: str) -> str:
+def build_raw_request_json(transcript: str, window_context: str,
+                           voiceink_prompt: str, custom_vocabulary: str) -> str:
     """Construct a valid VoiceInk-format raw_request_json envelope."""
 
     system_content = (
         f"{voiceink_prompt}\n\n"
         f"<CURRENT_WINDOW_CONTEXT>\n{window_context}\n</CURRENT_WINDOW_CONTEXT>\n\n"
-        f"<CUSTOM_VOCABULARY>\n{CUSTOM_VOCABULARY}\n</CUSTOM_VOCABULARY>"
+        f"<CUSTOM_VOCABULARY>\n{custom_vocabulary}\n</CUSTOM_VOCABULARY>"
     )
 
     user_content = f"<TRANSCRIPT>\n{transcript}\n</TRANSCRIPT>"
@@ -164,7 +163,8 @@ def build_raw_request_json(transcript: str, window_context: str, voiceink_prompt
 
 
 def generate_one(assignment: dict, model: str, dry_run: bool,
-                 generator_template: str, voiceink_prompt: str) -> tuple[dict, int, int] | None:
+                 generator_template: str, voiceink_prompt: str,
+                 custom_vocabulary: str) -> tuple[dict, int, int] | None:
     """Generate a single synthetic sample. Returns (record, raw_words, clean_words) or None."""
     prompt = build_prompt(assignment, generator_template)
     idx = assignment["index"]
@@ -195,7 +195,7 @@ def generate_one(assignment: dict, model: str, dry_run: bool,
         "timestamp": datetime.now().isoformat(),
         "model_used_for_label": model,
         "original_model": "synthetic",
-        "raw_request_json": build_raw_request_json(raw_transcript, window_ctx, voiceink_prompt),
+        "raw_request_json": build_raw_request_json(raw_transcript, window_ctx, voiceink_prompt, custom_vocabulary),
         "original_response": "",
         "label": clean_transcript,
     }
@@ -260,6 +260,7 @@ def main() -> None:
     # Read templates once
     generator_template = GENERATOR_PROMPT_PATH.read_text(encoding="utf-8")
     voiceink_prompt = VOICEINK_PROMPT_PATH.read_text(encoding="utf-8").strip()
+    custom_vocabulary = VOCABULARY_PATH.read_text(encoding="utf-8").strip()
 
     dataset = SyntheticDataset(args.output)
     existing = dataset.existing_ids()
@@ -286,7 +287,7 @@ def main() -> None:
 
     def process(assignment):
         return generate_one(assignment, args.model, args.dry_run,
-                           generator_template, voiceink_prompt)
+                           generator_template, voiceink_prompt, custom_vocabulary)
 
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = {executor.submit(process, a): a for a in todo}

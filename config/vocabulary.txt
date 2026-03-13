@@ -1,0 +1,31 @@
+Alien
+brake
+brake point
+Brands Hatch
+chicane
+Claude
+Claude Code
+cron
+cue
+Dragon Trail
+Electron
+Fuji Speedway
+GT Coach
+Interlagos
+json
+Laguna Seca
+Monza
+Mount Panorama
+Nürburgring
+OpenClaw
+prompt
+Silverstone
+Spa
+supabase
+Suzuka
+Tsukuba
+ultrathink
+unsloth
+VoiceInk
+Haiku
+Opus

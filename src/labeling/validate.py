@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -29,8 +30,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from common.extract import extract_from_record
 
 DEFAULT_INPUT = ROOT / "datasets" / "labeled.jsonl"
-DEFAULT_MODEL = "claude-haiku-4-5"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 VALIDATE_PROMPT_PATH = Path(__file__).resolve().parent / "validate_prompt.txt"
+VOCABULARY_PATH = ROOT / "config" / "vocabulary.txt"
 
 
 class LabeledDataset:
@@ -97,12 +99,16 @@ def parse_args() -> argparse.Namespace:
                    help="Validate only these specific request IDs (prefix match)")
     p.add_argument("--force", action="store_true",
                    help="Re-validate records that already have a validation field")
+    p.add_argument("--shuffle", action="store_true",
+                   help="Randomize the order of records before validating")
     p.add_argument("--show-failures", action="store_true",
                    help="Show all failed records and exit (no validation run)")
+    p.add_argument("--inspect", nargs="*", default=None,
+                   help="Show transcript, label, and validation for given IDs (prefix match)")
     return p.parse_args()
 
 
-def build_prompt(record: dict, template: str) -> str | None:
+def build_prompt(record: dict, template: str, custom_vocabulary: str) -> str | None:
     """Build the validation prompt for a labeled record."""
     try:
         components = extract_from_record(record)
@@ -114,12 +120,21 @@ def build_prompt(record: dict, template: str) -> str | None:
     if not transcript or not label:
         return None
 
-    return template.format(transcript=transcript, label=label)
+    return template.format(
+        transcript=transcript,
+        label=label,
+        custom_vocabulary=custom_vocabulary,
+        window_context=components["window_context"] or "(empty)",
+        clipboard_context=components["clipboard_context"] or "(empty)",
+    )
 
 
 def call_claude(prompt: str, model: str) -> str:
     """Call the Claude CLI and return the response text."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    env["CLAUDE_CODE_SKIP_UPDATE_CHECK"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
     result = subprocess.run(
         [
             "claude",
@@ -157,10 +172,10 @@ def parse_result(response: str) -> tuple[bool, str, str]:
 
 
 def validate_one(record: dict, model: str, dry_run: bool,
-                 template: str) -> tuple[str, dict] | None:
+                 template: str, custom_vocabulary: str) -> tuple[str, dict] | None:
     """Validate a single record. Returns (request_id, validation_dict) or None."""
     request_id = record["request_id"]
-    prompt = build_prompt(record, template)
+    prompt = build_prompt(record, template, custom_vocabulary)
     if prompt is None:
         return None
 
@@ -209,6 +224,49 @@ def show_failures(dataset: LabeledDataset) -> None:
         print()
 
 
+def inspect_records(dataset: LabeledDataset, prefixes: list[str]) -> None:
+    """Print transcript, label, and validation details for matching records.
+
+    If prefixes is empty, shows all failed records.
+    """
+    if prefixes:
+        matches = [r for r in dataset.records()
+                   if any(r["request_id"].startswith(p) for p in prefixes)]
+    else:
+        matches = [r for r in dataset.records()
+                   if r.get("validation", {}).get("status") == "fail"]
+
+    if not matches:
+        print("No records found." if prefixes else "No failed records.")
+        return
+
+    for i, record in enumerate(matches):
+        if i > 0:
+            print()
+
+        request_id = record["request_id"]
+        validation = record.get("validation", {})
+
+        try:
+            components = extract_from_record(record)
+            transcript = components["transcript"]
+        except (json.JSONDecodeError, KeyError):
+            transcript = "(failed to extract)"
+
+        label = record.get("label", "(no label)")
+
+        print(f"{'='*60}")
+        print(f"ID: {request_id}")
+        status = validation.get("status", "not validated")
+        if status == "fail":
+            print(f"Validation: FAIL {validation.get('type', '')} — {validation.get('reason', '')}")
+        else:
+            print(f"Validation: {status}")
+        print(f"\n--- RAW TRANSCRIPT ---\n{transcript}")
+        print(f"\n--- LABEL ---\n{label}")
+        print(f"{'='*60}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -218,6 +276,10 @@ def main() -> None:
 
     dataset = LabeledDataset(args.input)
     print(f"Loaded {len(dataset)} labeled records from {args.input}")
+
+    if args.inspect is not None:
+        inspect_records(dataset, args.inspect)
+        return
 
     if args.show_failures:
         show_failures(dataset)
@@ -240,6 +302,10 @@ def main() -> None:
             print(f"Skipping {already} already-validated records")
         print(f"{len(to_validate)} records need validation")
 
+    if args.shuffle:
+        random.shuffle(to_validate)
+        print("Shuffled records randomly")
+
     if args.limit > 0:
         to_validate = to_validate[:args.limit]
         print(f"Limiting to {len(to_validate)} records")
@@ -249,6 +315,7 @@ def main() -> None:
         return
 
     template = VALIDATE_PROMPT_PATH.read_text(encoding="utf-8")
+    custom_vocabulary = VOCABULARY_PATH.read_text(encoding="utf-8").strip()
     print(f"Validating with {args.model}, parallel={args.parallel}\n")
 
     fail_count = 0
@@ -258,7 +325,7 @@ def main() -> None:
     if args.parallel <= 1:
         for i, record in enumerate(to_validate, 1):
             print(f"[{i}/{len(to_validate)}] Validating {record['request_id']}...")
-            result = validate_one(record, args.model, args.dry_run, template)
+            result = validate_one(record, args.model, args.dry_run, template, custom_vocabulary)
             if result is None:
                 errors += 1
                 continue
@@ -272,7 +339,7 @@ def main() -> None:
     else:
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
             futures = {
-                pool.submit(validate_one, record, args.model, args.dry_run, template): record
+                pool.submit(validate_one, record, args.model, args.dry_run, template, custom_vocabulary): record
                 for record in to_validate
             }
             for i, future in enumerate(as_completed(futures), 1):

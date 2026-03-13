@@ -164,6 +164,9 @@ def generate_outputs(samples: list[dict], model: str, host: str, port: int) -> l
 def call_claude(prompt: str, model: str) -> str:
     """Call the Claude CLI and return the response text."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    env["CLAUDE_CODE_SKIP_UPDATE_CHECK"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
     result = subprocess.run(
         ["claude", "-p", prompt, "--model", model,
          "--disable-slash-commands", "--allowed-tools", ""],

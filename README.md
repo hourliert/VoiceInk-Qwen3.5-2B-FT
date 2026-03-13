@@ -93,7 +93,7 @@ python3 src/labeling/validate.py --show-failures       # review flagged records
 python3 src/labeling/validate.py --force --parallel 10  # re-validate all
 ```
 
-A lightweight quality gate that runs each label through **Claude Haiku 4.5** to check for meaning alteration, hallucination, over-deletion, repetition, or broken output. Results are written back into `labeled.jsonl` as a `validation` field on each record. Already-validated records are skipped unless `--force` is set.
+A lightweight quality gate that runs each label through **Claude Sonnet 4.6** to check for meaning alteration, hallucination, over-deletion, repetition, or broken output. Results are written back into `labeled.jsonl` as a `validation` field on each record. Already-validated records are skipped unless `--force` is set.
 
 `prepare_dataset.py` automatically excludes records where `validation.status == "fail"` (override with `--include-failed`).
 

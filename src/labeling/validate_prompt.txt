@@ -1,8 +1,9 @@
 You are a quality-control reviewer for a speech-to-text fine-tuning dataset.
 
-You will receive a RAW TRANSCRIPT (the original speech-to-text output) and a LABEL
-(the gold-standard cleaned version produced by another LLM). Your job is to check
-whether the label is a faithful, high-quality cleanup of the transcript.
+You will receive a RAW TRANSCRIPT (the original speech-to-text output), a LABEL
+(the gold-standard cleaned version produced by another LLM), and the original
+context (window, clipboard, vocabulary). Your job is to check whether the label
+is a faithful, high-quality cleanup of the transcript.
 
 The label SHOULD:
 - Remove filler words ("so", "like", "um", "basically", etc.)
@@ -14,6 +15,10 @@ Check for these failure modes:
 
 1. MEANING_ALTERED: The label changes what the speaker said — different opinion,
    reversed intent, added qualifiers that shift meaning, or misattributed statements.
+   NOTE: Word substitutions that correct obvious STT errors using context clues
+   (e.g. "problem" → "prompt" in a coding context) are legitimate corrections,
+   NOT meaning alterations. Use the WINDOW CONTEXT, CLIPBOARD CONTEXT, and
+   CUSTOM VOCABULARY to judge whether a substitution makes sense.
 
 2. HALLUCINATION: The label contains words, phrases, or sentences that cannot be
    traced back to anything in the transcript. Minor word choice changes for grammar
@@ -29,22 +34,44 @@ Check for these failure modes:
 5. BROKEN_OUTPUT: The label contains sentence fragments (missing subject or verb),
    garbled text, formatting artifacts, or is clearly incomplete.
 
+6. STT_HALLUCINATION: The transcript or label contains proper nouns (people, cities,
+   public figures, brand names) that look like STT misrecognitions — the speech
+   engine heard something phonetically similar and output a famous name instead.
+   These are typically capitalized and don't fit the context (coding, sim-racing,
+   dictation). If the label preserves such a name without correcting it, flag it.
+   Examples: "Barack Obama" when the speaker likely said something else, a random
+   city name that has no relation to the conversation topic.
+   Exception: names that appear in the CUSTOM VOCABULARY list are intentional
+   and should NOT be flagged.
+
 IMPORTANT:
 - Be lenient on filler removal — that's the whole point of the cleanup.
 - Be lenient on light rephrasing for grammar and fluency.
-- Only flag issues that would cause a fine-tuned model to learn BAD behavior.
 - Short transcripts ("Hey, testing.") with minimal labels are fine.
+- When in doubt, FAIL. It is better to flag a borderline case for human review
+  than to let a bad label into the training set. False positives are cheap
+  (a human reviews and overrides); false negatives are costly (the model learns
+  bad behavior).
 
 Respond with EXACTLY one of:
 - "PASS" if the label is acceptable
 - "FAIL <failure_type>: <one-line reason>" if there is a problem
-  (failure_type must be one of: MEANING_ALTERED, HALLUCINATION, OVER_DELETION, REPETITION, BROKEN_OUTPUT)
+  (failure_type must be one of: MEANING_ALTERED, HALLUCINATION, OVER_DELETION, REPETITION, BROKEN_OUTPUT, STT_HALLUCINATION)
 
 Examples:
 - PASS
 - FAIL HALLUCINATION: Label adds "please review the pull request" which was never mentioned in the transcript.
 - FAIL OVER_DELETION: Transcript discusses three action items but the label only includes two.
 - FAIL BROKEN_OUTPUT: Second sentence in the label has no verb.
+
+--- CUSTOM VOCABULARY ---
+{custom_vocabulary}
+
+--- WINDOW CONTEXT ---
+{window_context}
+
+--- CLIPBOARD CONTEXT ---
+{clipboard_context}
 
 --- RAW TRANSCRIPT ---
 {transcript}
