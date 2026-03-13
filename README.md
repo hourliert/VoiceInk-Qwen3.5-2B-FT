@@ -2,7 +2,7 @@
 
 A fine-tuned [Qwen 3.5 2B](https://huggingface.co/Qwen) model for improving raw speech-to-text transcriptions from [VoiceInk](https://voiceink.app), a macOS dictation app. This repo contains the full pipeline: inference server, data collection, LLM-as-judge labeling, synthetic data generation, fine-tuning, and evaluation.
 
-The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outperforms the 4B base model on quality, and handles everything from short dictation snippets to 30-minute QA session transcripts.
+The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outperforms same-quant Qwen 3.5 2B, 4B, 9B, 27B, and 35B-A3B baselines on this task, and handles everything from short dictation snippets to 30-minute QA session transcripts.
 
 **[Read the full blog post](docs/BLOG_POST.md)** for the complete story — from initial setup through five training iterations, a production bug caused by repetition amplification, and the synthetic data fix.
 
@@ -88,10 +88,10 @@ Output: `datasets/labeled.jsonl` — each record contains the original request, 
 ### 3. Synthetic data generation
 
 ```bash
-python3 src/synthetic/generate.py --count 120 --parallel 5
+python3 src/synthetic/generate.py --count 160 --parallel 5
 ```
 
-The fine-tuned model initially failed on long QA debrief transcripts (500-3500 words) — it amplified repetitive coaching phrases and filled the entire 16K context window. The root cause: only 4 long samples existed in 1,175 training records.
+The fine-tuned model initially failed on long QA debrief transcripts (500-3500 words) — it amplified repetitive coaching phrases and filled the entire 16K context window. The root cause: only 10 long samples existed in 1,451 training records.
 
 The synthetic generator uses Claude Sonnet 4.6 to produce realistic QA debrief transcripts for [GT Coach](https://gtcoach.app) (a sim-racing coaching app). Each sample includes:
 - Naturally repetitive corner-by-corner coaching phrases ("Corner 2, brake one beat earlier. It carried into corner 3. Your mid-corner speed is down.")
@@ -167,12 +167,17 @@ Supports `--resume` for interrupted evaluations and `--parallel` for concurrent 
 
 ### Quality (v5, latest)
 
-| Eval | Fine-tuned 2B | Baseline | Gap | Win rate |
-|---|---|---|---|---|
-| vs Qwen 3.5 4B | **91.6** | 81.9 | +9.7 | 76% (98/129) |
-| vs Qwen 3.5 2B base | **91.8** | 81.1 | +10.7 | 74% (87/117) |
+| Eval | FT 2B | Baseline | Gap | p-value | Win rate | Speedup |
+|---|---|---|---|---|---|---|
+| vs Qwen 3.5 2B | **91.1** | 79.7 | +11.4 | <.0001 | 91% (124/136) | 1.0x |
+| vs Qwen 3.5 4B | **91.5** | 81.4 | +10.1 | <.0001 | 91% (124/136) | 2.1x |
+| vs Qwen 3.5 9B | **90.9** | 81.6 | +9.3 | <.0001 | 90% (121/135) | 3.2x |
+| vs Qwen 3.5 27B | **91.2** | 86.8 | +4.4 | <.0001 | 68% (79/117) | 17.3x* |
+| vs Qwen 3.5 35B-A3B | **91.3** | 86.3 | +5.0 | <.0001 | 77% (98/127) | 4.2x |
 
-The fine-tuned 2B model outperforms the 4B base model across all dimensions while running **2.3x faster** (~250 vs ~140 tokens/second).
+*\*27B partially offloaded to system RAM (doesn't fit in 16GB VRAM).*
+
+161 eval samples per comparison, all models at Q4 quantization. The fine-tuned 2B outperforms every baseline while running **2.1x faster** than 4B (~250 vs ~140 tokens/second).
 
 ### Long transcript handling
 
@@ -190,18 +195,18 @@ Before synthetic data training, the model amplified repetitive coaching phrases 
 |---|---|---|
 | v3 | Better labels, LoRA rank 16→32, relabeled all 1,175 samples | 89.8 |
 | v4 | Completions-only training, cosine scheduler, 2e-4 LR | 92.1 |
-| v5 | + 120 synthetic QA debrief samples | 91.6 |
+| v5 | + 160 synthetic QA debrief samples | 91.5 |
 
-v5 trades a marginal 0.5 points on short dictation (within noise) for reliable long transcript handling.
+v5 trades a marginal score difference on short dictation (within noise) for reliable long transcript handling.
 
 ## Key learnings
 
-- **Model size doesn't help without fine-tuning**: Base 9B scores the same as base 4B (82.9 vs 82.3). Fine-tuned 2B beats both.
+- **Model size doesn't help without fine-tuning**: Base 9B scores the same as base 4B (81.6 vs 81.4). Fine-tuned 2B beats both.
 - **Completions-only training is a big win**: Training loss drops from ~0.85 to ~0.15 when masking system/user tokens.
 - **LLM-as-judge labeling works**: Claude Sonnet 4.6 produces consistent, high-quality labels that translate directly into model improvement.
-- **Synthetic data solves tail cases**: 120 synthetic long transcripts completely eliminated the repetition amplification bug that affected all model sizes.
+- **Synthetic data solves tail cases**: 160 synthetic long transcripts completely eliminated the repetition amplification bug that affected all model sizes.
 - **Cosine scheduler + higher LR outperforms linear**: 2e-4 with cosine beats 1e-4 with linear.
-- **2 epochs is sufficient**: No improvement beyond 2 epochs for this dataset size (~1,300 samples).
+- **2 epochs is sufficient**: No improvement beyond 2 epochs for this dataset size (~1,600 samples).
 
 ## Project structure
 
@@ -253,7 +258,7 @@ bin/start.sh
 python3 src/labeling/label.py --parallel 5
 
 # 3. (Optional) Generate synthetic data for edge cases
-python3 src/synthetic/generate.py --count 120 --parallel 5
+python3 src/synthetic/generate.py --count 160 --parallel 5
 
 # 4. Prepare the training dataset
 python3 src/training/prepare_dataset.py \
@@ -277,7 +282,7 @@ sudo systemctl restart llama-router
 
 - **GPU**: NVIDIA GeForce RTX 4080 Super (16GB VRAM)
 - **Inference**: ~250 tokens/second (Qwen 3.5 2B, Q4_K_M quantization)
-- **Training**: ~5 min/epoch for 1,300 samples with LoRA
+- **Training**: ~5 min/epoch for ~1,600 samples with LoRA
 - **Context window**: 16,384 tokens (training and inference)
 
 ## Built with

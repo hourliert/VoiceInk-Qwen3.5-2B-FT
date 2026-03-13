@@ -10,7 +10,7 @@
 - Used Claude to label gold-standard outputs and run comparative A/B evaluation.
 - Fine-tuned Qwen 3.5 2B with LoRA on an RTX 4080 Super (16GB VRAM).
 - The biggest quality jump came from completions-only training (loss dropped from ~0.85 to ~0.15).
-- A production failure on long transcripts exposed a training data distribution gap — 4 samples over 500 words out of 1,175.
+- A production failure on long transcripts exposed a training data distribution gap — 10 samples over 500 words out of 1,451.
 - Adding 160 synthetic long-form QA samples fixed the failure.
 - Final model beat same-quant Qwen 2B (+11.4), 4B (+10.1), 9B (+9.3), 27B (+4.4), and 35B-A3B (+5.0) baselines on this task. All gaps statistically significant (p < .0001).
 
