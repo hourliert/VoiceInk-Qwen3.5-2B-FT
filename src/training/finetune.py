@@ -196,6 +196,11 @@ def main() -> None:
             seed=3407,
             output_dir=str(args.output_dir),
             report_to="none",
+            # Evaluation during training (detect overfitting)
+            eval_strategy="steps" if eval_data else "no",
+            eval_steps=50,
+            fp16_full_eval=True,
+            per_device_eval_batch_size=1,
             # Required for vision finetuning:
             remove_unused_columns=False,
             dataset_text_field="",
