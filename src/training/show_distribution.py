@@ -22,13 +22,16 @@ BUCKETS = [
 ]
 
 
-def load_records(path):
+def load_records(path, require_reviewed=False):
     records = []
     with open(path) as f:
         for line in f:
             line = line.strip()
             if line:
-                records.append(json.loads(line))
+                r = json.loads(line)
+                if require_reviewed and not r.get("manually_reviewed"):
+                    continue
+                records.append(r)
     return records
 
 
@@ -88,7 +91,7 @@ def main():
     parser.add_argument("--extra-input", help="Additional data (e.g. synthetic) to show side-by-side")
     args = parser.parse_args()
 
-    real = load_records(args.input)
+    real = load_records(args.input, require_reviewed=True)
     real_counts = bucket_counts(real)
 
     if args.extra_input:

@@ -42,8 +42,6 @@ def parse_args() -> argparse.Namespace:
                    help=f"System prompt file to use for training (default: {DEFAULT_SYSTEM_PROMPT})")
     p.add_argument("--extra-input", type=Path, nargs="*", default=[],
                    help="Additional labeled JSONL files to merge (e.g., synthetic data)")
-    p.add_argument("--include-failed", action="store_true",
-                   help="Include records that failed validation (excluded by default)")
     return p.parse_args()
 
 
@@ -147,14 +145,13 @@ def main() -> None:
     if args.extra_input:
         print(f"Total records after merge: {len(records)}")
 
-    # Filter out failed validations
-    if not args.include_failed:
-        before = len(records)
-        records = [r for r in records
-                   if r.get("validation", {}).get("status") != "fail"]
-        excluded = before - len(records)
-        if excluded:
-            print(f"Excluded {excluded} records that failed validation")
+    # Only include manually reviewed records (synthetic data is always included)
+    before = len(records)
+    records = [r for r in records
+               if r.get("manually_reviewed") or r.get("request_id", "").startswith("syn-")]
+    excluded = before - len(records)
+    if excluded:
+        print(f"Excluded {excluded} records not manually reviewed")
 
     # Load system prompt
     if not args.system_prompt.exists():
