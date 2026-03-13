@@ -202,7 +202,7 @@ def show_failures(dataset: LabeledDataset) -> None:
     failures = []
     for record in dataset.records():
         v = record.get("validation", {})
-        if v.get("status") == "fail":
+        if v.get("status") == "fail" and not record.get("manually_reviewed"):
             failures.append(record)
 
     if not failures:
@@ -296,10 +296,11 @@ def main() -> None:
         to_validate = all_records
         print(f"Force re-validating all {len(to_validate)} records")
     else:
-        to_validate = [r for r in all_records if "validation" not in r]
+        to_validate = [r for r in all_records
+                       if "validation" not in r and not r.get("manually_reviewed")]
         already = len(all_records) - len(to_validate)
         if already:
-            print(f"Skipping {already} already-validated records")
+            print(f"Skipping {already} already-validated/reviewed records")
         print(f"{len(to_validate)} records need validation")
 
     if args.shuffle:
