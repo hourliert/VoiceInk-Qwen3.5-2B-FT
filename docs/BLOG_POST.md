@@ -148,11 +148,11 @@ graph TD
 
 Each raw transcript from the proxy logs gets sent to Claude Sonnet 4.6 with a [judge prompt](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/src/labeling/judge_prompt.txt). The judge receives the transcript along with structured context — custom vocabulary, clipboard content, active window title — and produces the ideal cleaned version.
 
-The biggest surprise of the project was that **label quality moved results more than hyperparameter tuning did**.
-
 The judge prompt went through three iterations. v1 passed the entire raw request as a blob — simple, but hard to control. v2 added rules based on manual review: I found the judge was over-cleaning, stripping genuine reactions like "Cool" and "That's fair", sometimes fabricating content, and producing fragments. Each problem became an explicit rule.
 
 v3 was a full rewrite aligned with a [product specification](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/docs/PRODUCT_SPEC.md) I wrote to codify exactly what "good cleanup" means. It switched to structured placeholders (`{transcript}`, `{custom_vocabulary}`, `{clipboard_context}`, `{window_context}`) and added guidance for French-English transfer patterns and Parakeet's specific misrecognition patterns. 1,451 samples labeled in about an hour with 5 concurrent Claude CLI calls.
+
+It turned out that iterating on label quality moved results more than hyperparameter tuning did — more on that in [v3](#v3-better-labels).
 
 ### Dataset Preparation
 
@@ -198,7 +198,7 @@ After fixing the sequence length bug and labeling more data (~400 samples), v2 t
 
 ### v3: Better Labels
 
-The turning point wasn't a training change — it was realizing that **label quality matters more than hyperparameters**. I reviewed labeled samples, found the judge was over-cleaning, wrote a product spec to codify what "good cleanup" means, rebuilt the judge prompt, and relabeled all 1,175 samples.
+I reviewed labeled samples and found the judge was over-cleaning: stripping genuine reactions, fabricating content, producing fragments. The fix wasn't more training — it was better data. I wrote a [product spec](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT/blob/master/docs/PRODUCT_SPEC.md) to codify what "good cleanup" means, rebuilt the judge prompt from scratch, and relabeled all 1,175 samples.
 
 The fine-tuned 2B scored 89.8 against the 4B baseline's 84.0. Closing the gap, but not yet surpassing it.
 
@@ -251,9 +251,9 @@ The model produced **7,215 words of output from a 3,266-word input**. It hit the
 
 ### What Was Happening
 
-The coaching app naturally says similar things each lap: "Corner 2, brake one beat earlier. It carried into corner 3. Your mid-corner speed is down." These phrases repeat because the driver makes similar mistakes each lap. A 6-lap session might have the same corner advice appearing 6-8 times — that's correct and should be preserved.
+[GT Coach](https://gtcoach.app) constructs coaching sentences with some determinism — the corner names are always the same, the sentence structures follow fixed patterns ("Corner N, brake one beat earlier", "It carried into corner N. Your mid-corner speed is down."). Across laps, the phrasing varies slightly, but the structural elements repeat. A 6-lap session produces a transcript dense with similar-looking coaching fragments — that's correct behavior and should be preserved faithfully.
 
-The model was amplifying this repetition. Where the input had a phrase 7 times, the output had it 16 times. Each repetitive token made the next one more likely, creating a positive feedback loop that filled the entire context window.
+The model was amplifying this structural repetition. Counting repeated 8-grams was a simple way to measure it: where the input had a phrase 7 times, the output had it 16 times. Each repetitive token made the next one more likely, creating a positive feedback loop that filled the entire context window.
 
 ```mermaid
 graph LR
@@ -286,13 +286,13 @@ The training data distribution told the story:
 
 | Input length | Samples | % of training data |
 |---|---|---|
-| 0-50 words | 858 | 68.5% |
-| 50-100 words | 293 | 23.4% |
-| 100-200 words | 86 | 6.9% |
-| 200-500 words | 7 | 0.6% |
-| 500+ words | **4** | **0.3%** |
+| 0-50 words | 1,042 | 71.8% |
+| 50-100 words | 309 | 21.3% |
+| 100-200 words | 84 | 5.8% |
+| 200-500 words | 6 | 0.4% |
+| 500+ words | **10** | **0.7%** |
 
-Four samples over 500 words out of 1,175 total. The model had essentially zero representation of long, repetitive transcripts. It had never learned the pattern of "preserve coaching phrase repetitions faithfully without amplifying them."
+Ten samples over 500 words out of 1,451 total. The model had essentially zero representation of long, repetitive transcripts. It had never learned the pattern of "preserve coaching phrase repetitions faithfully without amplifying them."
 
 ## Synthetic Data
 
@@ -304,13 +304,25 @@ I built a [synthetic data generator](https://github.com/hourliert/VoiceInk-Qwen3
 
 Each call produces both the raw transcript and the clean label in one shot, ensuring perfect alignment. 160 samples across varying lengths (500-3,500 words), with diversity across tracks, scenarios, and coaching patterns. The generation is resumable — if it crashes at sample 60, rerunning the same command continues from 61.
 
+The new distribution after merging real and synthetic data:
+
+| Input length | Before (real only) | After (real + synthetic) |
+|---|---|---|
+| 0-50 words | 1,042 (71.8%) | 1,036 (64.3%) |
+| 50-100 words | 309 (21.3%) | 308 (19.1%) |
+| 100-200 words | 84 (5.8%) | 84 (5.2%) |
+| 200-500 words | 6 (0.4%) | 7 (0.4%) |
+| 500+ words | **10 (0.7%)** | **176 (10.9%)** |
+
+The 500+ word bucket went from 10 samples to 176, with the longest at 4,277 words and a median of 1,728. The model now had substantial representation of the exact input distribution it was failing on.
+
 ### The VRAM Problem
 
 Training on the merged dataset (1,451 real + 160 synthetic) immediately hit out-of-memory errors. The reason is straightforward: VRAM usage scales with sequence length during forward+backward passes. The cross-entropy loss layer materializes a tensor of shape `(sequence_length x vocabulary_size)`. For Qwen 3.5's 248K vocabulary, an 11K-token sequence produces a ~5GB tensor — which is exactly what the OOM error reported.
 
 Previously, the longest real training sample was ~9,600 tokens and there was only one. The synthetic samples added 20+ sequences over 9,000 tokens. The probability of hitting a VRAM-busting sample went from negligible to near-certain.
 
-After trying CPU optimizer offload and 8-bit loading (neither enough), 4-bit base model loading combined with optimizer offload freed enough headroom. The quality impact is minimal — LoRA adapter weights are still trained in full precision; the quantization only affects the frozen base model weights that gradients flow through.
+Loading the base model in 4-bit freed enough headroom. The quality impact is minimal — LoRA adapter weights are still trained in full precision; the quantization only affects the frozen base model weights that gradients flow through.
 
 ### v5: The Fix
 
@@ -342,8 +354,10 @@ These are task-specific results on a 161-sample held-out eval set of real dictat
 | Qwen 3.5 2B | 79.7 | **91.1** | +11.4 | <.0001 | 91% (124/136) | 1.0x |
 | Qwen 3.5 4B | 81.4 | **91.5** | +10.1 | <.0001 | 91% (124/136) | 2.1x |
 | Qwen 3.5 9B | 81.6 | **90.9** | +9.3 | <.0001 | 90% (121/135) | 3.2x |
-| Qwen 3.5 27B | 86.8 | **91.2** | +4.4 | <.0001 | 68% (79/117) | 17.3x |
+| Qwen 3.5 27B | 86.8 | **91.2** | +4.4 | <.0001 | 68% (79/117) | 17.3x* |
 | Qwen 3.5 35B-A3B | 86.3 | **91.3** | +5.0 | <.0001 | 77% (98/127) | 4.2x |
+
+*\*The 27B model doesn't fit in 16GB VRAM and was partially offloaded to system RAM, making it far slower than it would be on hardware with enough VRAM. The speedup number reflects my setup, not the model's inherent throughput.*
 
 Win rates exclude ties (samples where both models scored identically). 95% CIs on the overall score gap range from [+2.4, +6.5] against 27B to [+9.6, +13.2] against the base 2B. All latency differences are statistically significant (p < .0001) except vs the base 2B (same model size).
 
