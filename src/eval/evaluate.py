@@ -262,6 +262,74 @@ def weighted_score(scores: dict) -> float:
     return round(raw / (MAX_SCORE * TOTAL_WEIGHT) * 100, 1)
 
 
+def _p_value(baseline: list[float], candidate: list[float]) -> float | None:
+    """Paired two-sided p-value. Wilcoxon if scipy available, else permutation."""
+    diffs = [c - b for b, c in zip(baseline, candidate)]
+    nonzero = [d for d in diffs if d != 0]
+    if len(nonzero) < 10:
+        return None
+    try:
+        from scipy.stats import wilcoxon
+        _, p = wilcoxon(nonzero)
+        return float(p)
+    except ImportError:
+        n = len(diffs)
+        observed = abs(sum(diffs) / n)
+        rng = random.Random(42)
+        count = sum(
+            1 for _ in range(10000)
+            if abs(sum(d * rng.choice((-1, 1)) for d in diffs) / n) >= observed
+        )
+        return count / 10000
+
+
+def _bootstrap_ci(baseline: list[float], candidate: list[float]) -> tuple[float, float]:
+    """Bootstrap 95% CI for mean difference (candidate - baseline)."""
+    diffs = [c - b for b, c in zip(baseline, candidate)]
+    n = len(diffs)
+    rng = random.Random(42)
+    boot_means = sorted(
+        sum(diffs[rng.randint(0, n - 1)] for _ in range(n)) / n
+        for _ in range(10000)
+    )
+    return round(boot_means[250], 2), round(boot_means[9749], 2)
+
+
+def _wilson_ci(wins: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion."""
+    if total == 0:
+        return 0.0, 0.0
+    p = wins / total
+    denom = 1 + z * z / total
+    centre = p + z * z / (2 * total)
+    spread = z * (p * (1 - p) / total + z * z / (4 * total * total)) ** 0.5
+    return round((centre - spread) / denom, 3), round((centre + spread) / denom, 3)
+
+
+def _percentile(sorted_values: list[float], p: float) -> float:
+    """Compute the p-th percentile (0-100) from a pre-sorted list."""
+    if not sorted_values:
+        return 0
+    k = (len(sorted_values) - 1) * p / 100
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = k - lo
+    return sorted_values[lo] + frac * (sorted_values[hi] - sorted_values[lo])
+
+
+def _latency_stats(sorted_durations: list[float]) -> dict:
+    """Compute latency stats from a pre-sorted list of durations in ms."""
+    if not sorted_durations:
+        return {"avg": 0, "p50": 0, "p90": 0, "p99": 0}
+    avg = sum(sorted_durations) / len(sorted_durations)
+    return {
+        "avg": round(avg, 1),
+        "p50": round(_percentile(sorted_durations, 50), 1),
+        "p90": round(_percentile(sorted_durations, 90), 1),
+        "p99": round(_percentile(sorted_durations, 99), 1),
+    }
+
+
 def aggregate(judgments: list[dict], baseline_outputs: list[dict],
               candidate_outputs: list[dict], baseline_model: str,
               candidate_model: str) -> dict:
@@ -293,11 +361,32 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
     b_avg = round(sum(baseline_weighted) / n, 1)
     c_avg = round(sum(candidate_weighted) / n, 1)
 
+    # Per-dimension significance
+    per_dimension = {}
+    for dim in WEIGHTS:
+        b_vals = per_dim_baseline[dim]
+        c_vals = per_dim_candidate[dim]
+        per_dimension[dim] = {
+            "baseline_avg": round(sum(b_vals) / n, 2),
+            "candidate_avg": round(sum(c_vals) / n, 2),
+            "weight": WEIGHTS[dim],
+            "p_value": _p_value(b_vals, c_vals),
+        }
+
+    # Overall significance
+    overall_p = _p_value(baseline_weighted, candidate_weighted)
+    overall_ci = _bootstrap_ci(baseline_weighted, candidate_weighted)
+
+    # Win rate CI (candidate wins / non-tied samples)
+    n_decided = wins["baseline"] + wins["candidate"]
+    win_rate_ci = _wilson_ci(wins["candidate"], n_decided) if n_decided > 0 else (0, 0)
+
     # Latency
-    b_durations = [o["duration_ms"] for o in baseline_outputs if o.get("duration_ms")]
-    c_durations = [o["duration_ms"] for o in candidate_outputs if o.get("duration_ms")]
-    b_latency = round(sum(b_durations) / len(b_durations), 1) if b_durations else 0
-    c_latency = round(sum(c_durations) / len(c_durations), 1) if c_durations else 0
+    b_durations = sorted(o["duration_ms"] for o in baseline_outputs if o.get("duration_ms"))
+    c_durations = sorted(o["duration_ms"] for o in candidate_outputs if o.get("duration_ms"))
+    b_latency = _latency_stats(b_durations)
+    c_latency = _latency_stats(c_durations)
+    latency_p = _p_value(b_durations, c_durations) if b_durations and c_durations else None
 
     # Winner determination
     winner, reason = determine_winner(
@@ -314,17 +403,14 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
         "baseline_avg_score": b_avg,
         "candidate_avg_score": c_avg,
         "wins": wins,
-        "per_dimension": {
-            dim: {
-                "baseline_avg": round(sum(per_dim_baseline[dim]) / n, 2),
-                "candidate_avg": round(sum(per_dim_candidate[dim]) / n, 2),
-                "weight": WEIGHTS[dim],
-            }
-            for dim in WEIGHTS
-        },
-        "baseline_avg_latency_ms": b_latency,
-        "candidate_avg_latency_ms": c_latency,
-        "speed_ratio": round(b_latency / c_latency, 2) if c_latency > 0 else 0,
+        "win_rate_ci_95": win_rate_ci,
+        "per_dimension": per_dimension,
+        "overall_p_value": overall_p,
+        "overall_ci_95": overall_ci,
+        "baseline_latency": b_latency,
+        "candidate_latency": c_latency,
+        "speed_ratio": round(b_latency["avg"] / c_latency["avg"], 2) if c_latency["avg"] > 0 else 0,
+        "latency_p_value": latency_p,
         "winner": winner,
         "winner_reason": reason,
     }
@@ -349,52 +435,84 @@ def determine_winner(b_avg, c_avg, b_dims, c_dims):
 
 # ---- Output ----
 
+def _fmt_p(p: float | None) -> str:
+    """Format a p-value."""
+    if p is None:
+        return "n/a   "
+    if p < 0.0001:
+        return "<.0001"
+    return f"{p:.4f}"
+
+
 def print_summary(summary: dict) -> None:
     """Print formatted summary table."""
     b_model = summary["baseline_model"]
     c_model = summary["candidate_model"]
     n = summary["n_samples"]
+    W = 72
 
     print()
-    print("=" * 64)
-    print(f"  EVALUATION: {b_model} vs {c_model} ({n} samples)")
-    print("=" * 64)
+    print("=" * W)
+    print(f"  EVALUATION: {b_model} vs {c_model}  (n={n})")
+    print("=" * W)
+
+    # ---- Quality per dimension ----
     print()
-    print("  Per-dimension scores (1-5 scale):")
-    print(f"  {'':30s} {'Baseline':>8s}  {'Candidate':>9s}  {'Weight':>6s}")
+    print("  Quality (1-5 scale):")
+    print(f"  {'':26s} {'Wt':>2s}  {'Baseline':>8s}  {'Candidate':>9s}  {'Diff':>6s}  {'p-value':>9s}")
+    print(f"  {'':26s} {'--':>2s}  {'--------':>8s}  {'---------':>9s}  {'----':>6s}  {'---------':>9s}")
     for dim in WEIGHTS:
         info = summary["per_dimension"][dim]
         b_val = info["baseline_avg"]
         c_val = info["candidate_avg"]
-        flag = " ***" if abs(b_val - c_val) >= 0.5 else ""
-        print(f"  {dim:30s} {b_val:8.2f}  {c_val:9.2f}  {info['weight']:5d}x{flag}")
+        diff = c_val - b_val
+        p_str = _fmt_p(info.get("p_value"))
+        label = dim.replace("_", " ")
+        print(f"  {label:26s} {info['weight']:>2d}  {b_val:8.2f}  {c_val:9.2f}  {diff:+5.2f}  {p_str}")
 
-    print()
-    print("  Overall weighted score (0-100):")
-    print(f"    Baseline:    {summary['baseline_avg_score']}")
-    print(f"    Candidate:   {summary['candidate_avg_score']}")
+    # ---- Overall score ----
+    print(f"  {'-' * (W - 2)}")
+    b_avg = summary["baseline_avg_score"]
+    c_avg = summary["candidate_avg_score"]
+    diff = round(c_avg - b_avg, 1)
+    overall_p = _fmt_p(summary.get("overall_p_value"))
+    ci = summary.get("overall_ci_95", (0, 0))
+    print(f"  {'Overall (weighted, 0-100)':26s}     {b_avg:8.1f}  {c_avg:9.1f}  {diff:+5.1f}  {overall_p}")
+    print(f"  {'':26s}     {'':8s}  {'':9s}  {'':6s}  95% CI [{ci[0]:+.1f}, {ci[1]:+.1f}]")
 
+    # ---- Win rate ----
     w = summary["wins"]
+    n_decided = w["baseline"] + w["candidate"]
+    win_pct = w["candidate"] / n_decided * 100 if n_decided else 0
+    wr_ci = summary.get("win_rate_ci_95", (0, 0))
     print()
-    print(f"  Win/Loss/Tie:  {w['baseline']} / {w['candidate']} / {w['tie']}"
-          f"  (baseline / candidate / tie)")
+    print(f"  Win rate: {win_pct:.0f}% ({w['candidate']}/{n_decided})"
+          f"  95% CI [{wr_ci[0]*100:.0f}%, {wr_ci[1]*100:.0f}%]"
+          f"  (ties: {w['tie']})")
 
-    b_lat = summary["baseline_avg_latency_ms"]
-    c_lat = summary["candidate_avg_latency_ms"]
-    if b_lat and c_lat:
-        print()
-        print(f"  Latency:")
-        print(f"    Baseline avg:    {b_lat:.0f} ms")
+    # ---- Latency ----
+    b_lat = summary.get("baseline_latency", {})
+    c_lat = summary.get("candidate_latency", {})
+    if b_lat.get("avg") and c_lat.get("avg"):
         ratio = summary["speed_ratio"]
-        faster = f"({ratio:.1f}x faster)" if ratio > 1 else ""
-        print(f"    Candidate avg:   {c_lat:.0f} ms  {faster}")
+        lat_p = _fmt_p(summary.get("latency_p_value"))
+        print()
+        print(f"  Latency (ms):          {'Baseline':>10s}  {'Candidate':>10s}  {'Speedup':>7s}")
+        print(f"  {'':22s}  {'----------':>10s}  {'----------':>10s}  {'-------':>7s}")
+        for stat in ("avg", "p50", "p90", "p99"):
+            b_v = b_lat[stat]
+            c_v = c_lat[stat]
+            spd = f"{b_v / c_v:.1f}x" if c_v > 0 else ""
+            print(f"    {stat:20s}  {b_v:10.0f}  {c_v:10.0f}  {spd:>7s}")
+        print(f"  {'':22s}  {'':10s}  {'':10s}  {lat_p}")
 
+    # ---- Verdict ----
     print()
+    print(f"  {'-' * (W - 2)}")
     winner = summary["winner"].upper()
     reason = summary["winner_reason"]
-    print(f"  WINNER: {winner}")
-    print(f"  Reason: {reason}")
-    print("=" * 64)
+    print(f"  WINNER: {winner}  |  {reason}")
+    print("=" * W)
     print()
 
 
