@@ -252,6 +252,7 @@ src/
   eval/
     evaluate.py                  # A/B evaluation pipeline
     judge_prompt.txt             # Evaluation scoring rubric
+Modelfile                            # Ollama model definition
 datasets/                        # Training data (gitignored, *.jsonl)
 models/                          # GGUF model files (gitignored)
 logs/                            # Proxy request logs (gitignored)
@@ -298,6 +299,76 @@ python3 src/eval/evaluate.py \
 sudo systemctl restart llama-router
 ```
 
+## Using the model
+
+The fine-tuned model is [available on Ollama](https://ollama.com/hourliert/voiceink-qwen3.5-2b):
+
+```bash
+ollama pull hourliert/voiceink-qwen3.5-2b
+```
+
+### Quick test
+
+```bash
+ollama run hourliert/voiceink-qwen3.5-2b \
+  "<TRANSCRIPT>yeah so like i think voice ink is working pretty well actually</TRANSCRIPT>"
+# Output: I think VoiceInk is working pretty well.
+```
+
+### Input format
+
+The model expects a user message with the transcript wrapped in `<TRANSCRIPT>` tags, and optionally context tags for better accuracy. The system prompt (baked into the Ollama model) tells the model how to use these.
+
+**Minimal** — just the transcript:
+
+```
+<TRANSCRIPT>
+yeah so like i think we should probably use redis for the caching layer
+</TRANSCRIPT>
+```
+
+**With context** — vocabulary, window, and clipboard for better STT error correction:
+
+```
+<CURRENT_WINDOW_CONTEXT>
+Terminal - claude
+</CURRENT_WINDOW_CONTEXT>
+
+<CUSTOM_VOCABULARY>
+Claude Code, Redis, PostgreSQL, VoiceInk
+</CUSTOM_VOCABULARY>
+
+<CLIPBOARD_CONTEXT>
+def get_cache_key(user_id):
+</CLIPBOARD_CONTEXT>
+
+<TRANSCRIPT>
+yeah so like i think we should probably use redis for the cashing layer
+</TRANSCRIPT>
+```
+
+The context tags help the model correct STT errors (e.g. "cashing" → "caching" when the clipboard contains cache-related code). This is how [VoiceInk](https://voiceink.app) sends requests — see [`src/training/prepare_dataset.py:build_user_message()`](src/training/prepare_dataset.py) for the exact construction, and [`docs/VOICEINK_PROMPT`](docs/VOICEINK_PROMPT) for the full system prompt.
+
+### API usage
+
+For programmatic use, send OpenAI-compatible chat completion requests:
+
+```bash
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "hourliert/voiceink-qwen3.5-2b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "<TRANSCRIPT>\nyeah so like can you check the previous slab for timing data\n</TRANSCRIPT>"
+      }
+    ]
+  }'
+```
+
+VoiceInk sends its own system prompt with each request (overriding the Modelfile default), along with dynamic context tags populated from the active window, clipboard, and custom vocabulary settings.
+
 ## Hardware
 
 - **GPU**: NVIDIA GeForce RTX 4080 Super (16GB VRAM)
@@ -307,6 +378,7 @@ sudo systemctl restart llama-router
 
 ## Built with
 
+- [Ollama](https://ollama.com) — Local model distribution and inference
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) — LLM inference
 - [Unsloth](https://github.com/unslothai/unsloth) — LoRA fine-tuning
 - [Qwen 3.5](https://huggingface.co/Qwen) — Base model family
