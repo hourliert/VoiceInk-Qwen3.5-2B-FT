@@ -105,6 +105,8 @@ def parse_args() -> argparse.Namespace:
                    help="Show all failed records and exit (no validation run)")
     p.add_argument("--inspect", nargs="*", default=None,
                    help="Show transcript, label, and validation for given IDs (prefix match)")
+    p.add_argument("--mark-reviewed", action="store_true",
+                   help="Mark all records as manually_reviewed and exit")
     return p.parse_args()
 
 
@@ -276,6 +278,21 @@ def main() -> None:
 
     dataset = LabeledDataset(args.input)
     print(f"Loaded {len(dataset)} labeled records from {args.input}")
+
+    if args.mark_reviewed:
+        updated = 0
+        for record in dataset.records():
+            if not record.get("manually_reviewed"):
+                updated += 1
+        if updated:
+            with dataset._lock:
+                for record in dataset._records.values():
+                    record["manually_reviewed"] = True
+                dataset._flush()
+            print(f"Marked {updated} records as manually_reviewed")
+        else:
+            print("All records already marked as manually_reviewed")
+        return
 
     if args.inspect is not None:
         inspect_records(dataset, args.inspect)
