@@ -27,6 +27,7 @@ logs/
 # Extracted data outputs
 *.csv
 *.jsonl
+*.jsonl.bak
 
 # Unsloth compiled cache
 unsloth_compiled_cache/

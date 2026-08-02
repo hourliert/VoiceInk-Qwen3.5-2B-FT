@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly ROUTER_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 readonly LLAMA_SERVER="${LLAMA_SERVER:-/home/thomas/llama.cpp/llama-server}"
-readonly LLAMA_HOST=127.0.0.1
+readonly LLAMA_HOST=0.0.0.0
 readonly LLAMA_PORT=8002
 readonly PROXY_HOST=0.0.0.0
 readonly PROXY_PORT=8001
@@ -26,7 +26,6 @@ trap cleanup EXIT INT TERM
   --host "${LLAMA_HOST}" \
   --port "${LLAMA_PORT}" \
   --parallel 1 \
-  --ctx-size 16384 \
   --flash-attn on \
   --jinja \
   --metrics \

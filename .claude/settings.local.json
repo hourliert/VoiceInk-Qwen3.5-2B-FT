@@ -11,7 +11,8 @@
       "Bash(.venv/bin/uv pip:*)",
       "Bash(git status:*)",
       "Bash(git log:*)",
-      "Bash(git diff:*)"
+      "Bash(git diff:*)",
+      "Bash(python3 src/labeling/validate.py --show-failures)"
     ]
   }
 }

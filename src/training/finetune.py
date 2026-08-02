@@ -158,7 +158,7 @@ def main() -> None:
     print(f"  {len(train_data)} training samples")
 
     eval_data = None
-    if args.eval.exists():
+    if args.eval and args.eval.is_file():
         eval_data = load_dataset_jsonl(args.eval)
         print(f"  {len(eval_data)} eval samples")
 
@@ -199,7 +199,7 @@ def main() -> None:
             # Evaluation during training (detect overfitting)
             eval_strategy="steps" if eval_data else "no",
             eval_steps=50,
-            fp16_full_eval=True,
+            fp16_full_eval=not args.load_in_4bit,
             per_device_eval_batch_size=1,
             # Required for vision finetuning:
             remove_unused_columns=False,
