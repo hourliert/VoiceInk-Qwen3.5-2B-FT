@@ -35,9 +35,11 @@ unsloth_compiled_cache/
 # Training outputs (checkpoints, adapter weights, etc.)
 training/lora/
 training/outputs/
+training/lfm25/
 
 # Unsloth merged/exported model artifacts
 models/Qwen3.5-2B-voiceink*/
+models/LFM2.5-1.2B-VoiceInk*/
 
 # Eval results
 results/

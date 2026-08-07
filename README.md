@@ -156,6 +156,29 @@ The script auto-snapshots `datasets/labeled.jsonl` before training and auto-back
 - `--load-in-8bit` — loads in 8-bit (moderate savings)
 - `--offload-optimizer` — moves optimizer states to CPU RAM (no quality impact, slower)
 
+#### LFM2.5 1.2B experiment
+
+LFM2.5 uses the same reviewed VoiceInk labels and synthetic samples, but its
+text-only chat template expects string message content. Keep its prepared data,
+LoRA adapter, checkpoints, and GGUF exports isolated from the Qwen workflow:
+
+```bash
+python3 src/training/prepare_dataset.py \
+  --content-format string \
+  --extra-input datasets/synthetic/labeled.jsonl \
+  --output datasets/lfm25/train.jsonl \
+  --eval-output datasets/lfm25/eval.jsonl
+
+# Validates data and configuration without loading a model or using the GPU.
+.venv/bin/python3 src/training/finetune_lfm25.py \
+  --check-only --export-gguf q4_k_m q8_0
+```
+
+The dedicated trainer defaults to `LiquidAI/LFM2.5-1.2B-Instruct`, a 16K
+training context, LoRA rank/alpha 16, an effective batch size of 8, one epoch,
+and completions-only loss. Run a one-step smoke test before the full job; use
+`--load-in-4bit` if the BF16 smoke test exceeds available VRAM. The `--check-only` path exits before importing Unsloth or loading the model.
+
 ### 6. Evaluation
 
 ```bash

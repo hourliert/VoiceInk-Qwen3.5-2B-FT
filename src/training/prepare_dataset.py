@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
                    help=f"System prompt file to use for training (default: {DEFAULT_SYSTEM_PROMPT})")
     p.add_argument("--extra-input", type=Path, nargs="*", default=[],
                    help="Additional labeled JSONL files to merge (e.g., synthetic data)")
+    p.add_argument("--content-format", choices=("text-blocks", "string"),
+                   default="text-blocks",
+                   help="Message content representation: text-blocks for Qwen VLMs "
+                        "(default), string for text-only models such as LFM2.5")
     return p.parse_args()
 
 
@@ -63,7 +67,15 @@ def build_user_message(components: dict) -> str:
     return "\n\n".join(parts)
 
 
-def convert_record(record: dict, system_prompt: str) -> dict | None:
+def message_content(text: str, content_format: str) -> str | list[dict]:
+    """Represent message text in the format expected by the target model."""
+    if content_format == "string":
+        return text
+    return [{"type": "text", "text": text}]
+
+
+def convert_record(record: dict, system_prompt: str,
+                   content_format: str = "text-blocks") -> dict | None:
     """Convert a labeled record to chat messages format.
 
     Extracts structured components from the original request, then
@@ -71,9 +83,8 @@ def convert_record(record: dict, system_prompt: str) -> dict | None:
     decouples training data from whatever prompt VoiceInk sent at
     recording time.
 
-    Qwen 3.5 is a unified VLM, so content must be a list of typed blocks
-    (even for text-only input) to avoid the vision processor treating
-    plain strings as image paths.
+    The default typed blocks are required by the Qwen 3.5 VLM processor.
+    Text-only models such as LFM2.5 use plain string content instead.
     """
     try:
         components = extract_from_record(record)
@@ -89,15 +100,15 @@ def convert_record(record: dict, system_prompt: str) -> dict | None:
     messages = [
         {
             "role": "system",
-            "content": [{"type": "text", "text": system_prompt}],
+            "content": message_content(system_prompt, content_format),
         },
         {
             "role": "user",
-            "content": [{"type": "text", "text": user_content}],
+            "content": message_content(user_content, content_format),
         },
         {
             "role": "assistant",
-            "content": [{"type": "text", "text": label}],
+            "content": message_content(label, content_format),
         },
     ]
 
@@ -164,7 +175,7 @@ def main() -> None:
     converted = []
     skipped = 0
     for record in records:
-        result = convert_record(record, system_prompt)
+        result = convert_record(record, system_prompt, args.content_format)
         if result:
             converted.append(result)
         else:
