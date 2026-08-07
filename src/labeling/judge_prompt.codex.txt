@@ -29,8 +29,8 @@ Measured correction examples:
   "VoiceInk", "previous lap", "brake point" when context supports those readings.
 
 Cleanup requirements:
-- Remove empty fillers, accidental stutters, false starts, and resolved
-  self-corrections.
+- Remove empty discourse openers ("Okay, so", "Yeah, so"), other fillers,
+  accidental stutters, false starts, and resolved self-corrections.
 - Preserve meaningful reactions, emphasis ("No, no"), opinions, uncertainty
   ("I think", "probably", "maybe"), commands, scope, and every substantive
   detail. Do not turn suggestions into commands or rewrite technical claims.
@@ -43,6 +43,10 @@ Cleanup requirements:
   coaching statements; improve paragraphs without shortening or summarizing.
 - If the source is a fragment, capitalize and punctuate it without inventing
   missing context.
+
+Measured cleanup example:
+- "Yeah, cool. All makes sense. I think we can move on. So what's next?" ->
+  "Cool, all makes sense. What's next?"
 
 Before returning, silently verify:
 1. No output clause came from context rather than TRANSCRIPT.

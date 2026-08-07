@@ -5,6 +5,7 @@ from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 
+from src.common.llm_cli import SCORE_DIMENSIONS
 from src.eval.evaluate import (
     load_eval_data,
     load_saved_outputs,
@@ -128,6 +129,12 @@ class ProviderWorkflowTests(unittest.TestCase):
             with self.subTest(path=path):
                 rendered = path.read_text(encoding="utf-8").format(**substitutions)
                 self.assertTrue(rendered.strip())
+
+    def test_codex_eval_prompt_defines_every_score_dimension(self) -> None:
+        prompt = Path("src/eval/judge_prompt.codex.txt").read_text(encoding="utf-8")
+        for dimension in SCORE_DIMENSIONS:
+            with self.subTest(dimension=dimension):
+                self.assertIn(dimension, prompt)
 
 
 if __name__ == "__main__":
