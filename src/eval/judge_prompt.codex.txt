@@ -12,7 +12,9 @@ Evidence policy:
 Scoring rules:
 - Score A and B independently. Their order is randomized and model identities
   are hidden.
-- Identical or substantively equivalent outputs must receive identical scores.
+- Assign different A/B scores for a dimension only when a concrete textual
+  difference affects that dimension. Shared errors receive the same penalty;
+  identical or substantively equivalent outputs receive identical scores.
 - Judge only text that is present. Do not infer unobserved intent or reward
   length by itself.
 - Score each dimension on its own evidence. Correct filler removal must not

@@ -44,6 +44,27 @@ class ProviderWorkflowTests(unittest.TestCase):
         self.assertEqual(sample["raw_transcript"], "Hello")
         self.assertEqual(sample["gold_label"], "Hello.")
 
+    def test_eval_loader_uses_last_transcript_tag_pair(self) -> None:
+        path = self.write_jsonl([{
+            "messages": [
+                {"role": "system", "content": "system"},
+                {
+                    "role": "user",
+                    "content": (
+                        "<CURRENT_WINDOW_CONTEXT>"
+                        "example <TRANSCRIPT>\\s*(.*?)\\s*</TRANSCRIPT>"
+                        "</CURRENT_WINDOW_CONTEXT>"
+                        "<TRANSCRIPT>Actual dictated text.</TRANSCRIPT>"
+                    ),
+                },
+                {"role": "assistant", "content": "Actual dictated text."},
+            ]
+        }])
+
+        sample = load_eval_data(path)[0]
+
+        self.assertEqual(sample["raw_transcript"], "Actual dictated text.")
+
     def test_judge_response_requires_every_integer_score(self) -> None:
         scores = {
             "meaning_preservation": 5,
@@ -65,6 +86,7 @@ class ProviderWorkflowTests(unittest.TestCase):
 
     def test_saved_outputs_accept_completed_eval_files(self) -> None:
         path = self.write_jsonl([{
+            "sample_index": 0,
             "raw_transcript": "Hello",
             "baseline_output": "Baseline",
             "candidate_output": "Candidate",
@@ -74,10 +96,12 @@ class ProviderWorkflowTests(unittest.TestCase):
             "candidate_scores": {},
         }])
 
-        outputs = load_saved_outputs(path)["Hello"]
+        saved_outputs = load_saved_outputs(path)
+        outputs = saved_outputs["Hello"]
 
         self.assertEqual(outputs["baseline"]["text"], "Baseline")
         self.assertEqual(outputs["candidate"]["duration_ms"], 5)
+        self.assertIs(outputs, saved_outputs[0])
 
     def test_reference_loader_keeps_human_label_metadata(self) -> None:
         path = self.write_jsonl([{

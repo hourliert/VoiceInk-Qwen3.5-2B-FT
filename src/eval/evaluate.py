@@ -14,7 +14,6 @@ import datetime
 import http.client
 import json
 import random
-import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -94,6 +93,19 @@ def message_text(content) -> str:
     raise ValueError(f"Unsupported message content type: {type(content).__name__}")
 
 
+def extract_last_tag_content(text: str, tag: str) -> str | None:
+    """Extract the last complete tag pair, ignoring examples in earlier context."""
+    opening = f"<{tag}>"
+    closing = f"</{tag}>"
+    close_index = text.rfind(closing)
+    if close_index < 0:
+        return None
+    open_index = text.rfind(opening, 0, close_index)
+    if open_index < 0:
+        return None
+    return text[open_index + len(opening):close_index].strip()
+
+
 def load_eval_data(path: Path) -> list[dict]:
     """Load eval.jsonl and extract messages + gold label."""
     samples = []
@@ -110,11 +122,11 @@ def load_eval_data(path: Path) -> list[dict]:
             gold_label = message_text(msgs[2]["content"])
 
             # Extract raw transcript and vocabulary from user message
-            m = re.search(r"<TRANSCRIPT>\s*(.*?)\s*</TRANSCRIPT>", user_text, re.DOTALL)
-            raw_transcript = m.group(1).strip() if m else user_text.strip()
+            transcript = extract_last_tag_content(user_text, "TRANSCRIPT")
+            raw_transcript = transcript if transcript is not None else user_text.strip()
 
-            v = re.search(r"<CUSTOM_VOCABULARY>\s*(.*?)\s*</CUSTOM_VOCABULARY>", user_text, re.DOTALL)
-            custom_vocabulary = v.group(1).strip() if v else ""
+            vocabulary = extract_last_tag_content(user_text, "CUSTOM_VOCABULARY")
+            custom_vocabulary = vocabulary if vocabulary is not None else ""
 
             samples.append({
                 "system_text": system_text,
@@ -145,7 +157,7 @@ def load_cached_results(path: Path) -> dict[str, dict]:
     return cache
 
 
-def load_saved_outputs(path: Path) -> dict[str, dict]:
+def load_saved_outputs(path: Path) -> dict[str | int, dict]:
     """Load generated outputs from either a generation or completed eval JSONL."""
     outputs = {}
     with path.open("r", encoding="utf-8") as stream:
@@ -156,7 +168,7 @@ def load_saved_outputs(path: Path) -> dict[str, dict]:
             key = record.get("raw_transcript", "")
             if not key or "baseline_output" not in record or "candidate_output" not in record:
                 continue
-            outputs[key] = {
+            output = {
                 "baseline": {
                     "text": record["baseline_output"],
                     "duration_ms": record.get("baseline_duration_ms", 0),
@@ -166,6 +178,10 @@ def load_saved_outputs(path: Path) -> dict[str, dict]:
                     "duration_ms": record.get("candidate_duration_ms", 0),
                 },
             }
+            outputs[key] = output
+            sample_index = record.get("sample_index")
+            if isinstance(sample_index, int):
+                outputs[sample_index] = output
     return outputs
 
 
@@ -694,7 +710,10 @@ def main() -> None:
         saved_outputs = load_saved_outputs(args.outputs)
         missing = []
         for i in uncached_indices:
-            saved = saved_outputs.get(samples[i]["raw_transcript"])
+            saved = (
+                saved_outputs.get(samples[i]["raw_transcript"])
+                or saved_outputs.get(i)
+            )
             if not saved:
                 missing.append(i)
                 continue
