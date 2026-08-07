@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Validate labeled dataset quality using a cheap LLM as reviewer.
+"""Validate labeled dataset quality using a configured LLM reviewer.
 
-Runs each labeled sample through a fast model (Haiku by default) to flag
-labels that may contain hallucinations, meaning changes, over-deletions,
-repetitions, or broken output. Results are written back into the labeled
-JSONL file as a "validation" field on each record.
+Runs each labeled sample through a CLI provider to flag labels that may contain
+hallucinations, meaning changes, over-deletions, repetitions, or broken output.
+Results are written back into the labeled JSONL file as a "validation" field
+on each record.
 
 Designed as a quality gate between labeling and training — prepare_dataset.py
 skips records where validation.status == "fail".
@@ -17,9 +17,7 @@ Usage:
 """
 import argparse
 import json
-import os
 import random
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,9 +26,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from common.extract import extract_from_record
+from common.llm_cli import (
+    VALIDATION_SCHEMA,
+    add_provider_args,
+    call_llm,
+    parse_json_response,
+    provider_metadata,
+    provider_prompt_path,
+    resolve_model,
+)
 
 DEFAULT_INPUT = ROOT / "datasets" / "labeled.jsonl"
-DEFAULT_MODEL = "claude-sonnet-4-6"
 VALIDATE_PROMPT_PATH = Path(__file__).resolve().parent / "validate_prompt.txt"
 VOCABULARY_PATH = ROOT / "config" / "vocabulary.txt"
 
@@ -90,11 +96,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0,
                    help="Max samples to validate (0 = all)")
     p.add_argument("--parallel", type=int, default=1,
-                   help="Number of parallel Claude CLI calls")
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help=f"Claude model to use (default: {DEFAULT_MODEL})")
+                   help="Number of parallel CLI calls")
+    add_provider_args(p)
     p.add_argument("--dry-run", action="store_true",
-                   help="Print prompts without calling Claude")
+                   help="Print prompts without calling the configured provider")
     p.add_argument("--ids", nargs="*", default=None,
                    help="Validate only these specific request IDs (prefix match)")
     p.add_argument("--force", action="store_true",
@@ -103,6 +108,8 @@ def parse_args() -> argparse.Namespace:
                    help="Randomize the order of records before validating")
     p.add_argument("--show-failures", action="store_true",
                    help="Show all failed records and exit (no validation run)")
+    p.add_argument("--show-calibration", action="store_true",
+                   help="Show candidate and reference labels side by side, then exit")
     p.add_argument("--inspect", nargs="*", default=None,
                    help="Show transcript, label, and validation for given IDs (prefix match)")
     p.add_argument("--mark-reviewed", action="store_true",
@@ -131,30 +138,6 @@ def build_prompt(record: dict, template: str, custom_vocabulary: str) -> str | N
     )
 
 
-def call_claude(prompt: str, model: str) -> str:
-    """Call the Claude CLI and return the response text."""
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    env["CLAUDE_CODE_SKIP_UPDATE_CHECK"] = "1"
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
-    result = subprocess.run(
-        [
-            "claude",
-            "-p", prompt,
-            "--model", model,
-            "--disable-slash-commands",
-            "--allowed-tools", "",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env=env,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
 def parse_result(response: str) -> tuple[bool, str, str]:
     """Parse reviewer response into (passed, failure_type, reason)."""
     response = response.strip()
@@ -173,7 +156,8 @@ def parse_result(response: str) -> tuple[bool, str, str]:
     return True, "", ""
 
 
-def validate_one(record: dict, model: str, dry_run: bool,
+def validate_one(record: dict, provider: str, model: str,
+                 reasoning_effort: str, dry_run: bool,
                  template: str, custom_vocabulary: str) -> tuple[str, dict] | None:
     """Validate a single record. Returns (request_id, validation_dict) or None."""
     request_id = record["request_id"]
@@ -188,12 +172,32 @@ def validate_one(record: dict, model: str, dry_run: bool,
         return None
 
     try:
-        response = call_claude(prompt, model)
-        passed, failure_type, reason = parse_result(response)
-        if passed:
-            return request_id, {"status": "pass"}
+        schema = VALIDATION_SCHEMA if provider == "codex" else None
+        response = call_llm(
+            prompt,
+            provider=provider,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            output_schema=schema,
+            timeout=120,
+        )
+        if schema:
+            parsed = parse_json_response(response)
+            passed = parsed.get("status") == "pass"
+            failure_type = str(parsed.get("type", "")).strip()
+            reason = str(parsed.get("reason", "")).strip()
         else:
-            return request_id, {"status": "fail", "type": failure_type, "reason": reason}
+            passed, failure_type, reason = parse_result(response)
+        metadata = provider_metadata(provider, model, reasoning_effort)
+        if passed:
+            return request_id, {"status": "pass", "reviewer": metadata}
+        else:
+            return request_id, {
+                "status": "fail",
+                "type": failure_type or "UNKNOWN",
+                "reason": reason,
+                "reviewer": metadata,
+            }
     except Exception as exc:
         print(f"  ERROR [{request_id}]: {exc}", file=sys.stderr)
         return None
@@ -256,6 +260,7 @@ def inspect_records(dataset: LabeledDataset, prefixes: list[str]) -> None:
             transcript = "(failed to extract)"
 
         label = record.get("label", "(no label)")
+        reference_label = record.get("reference_label")
 
         print(f"{'='*60}")
         print(f"ID: {request_id}")
@@ -265,12 +270,35 @@ def inspect_records(dataset: LabeledDataset, prefixes: list[str]) -> None:
         else:
             print(f"Validation: {status}")
         print(f"\n--- RAW TRANSCRIPT ---\n{transcript}")
-        print(f"\n--- LABEL ---\n{label}")
+        if reference_label is not None:
+            reference_model = record.get("reference_model_used_for_label", "unknown")
+            reviewed = record.get("reference_manually_reviewed", False)
+            print(
+                f"\n--- REFERENCE LABEL ({reference_model}; "
+                f"manually_reviewed={reviewed}) ---\n{reference_label}"
+            )
+            print(f"\n--- CANDIDATE LABEL ---\n{label}")
+        else:
+            print(f"\n--- LABEL ---\n{label}")
         print(f"{'='*60}")
+
+
+def show_calibration(dataset: LabeledDataset) -> None:
+    """Print every record containing a retained calibration reference."""
+    matches = [
+        record for record in dataset.records()
+        if "reference_label" in record
+    ]
+    if not matches:
+        print("No calibration records with reference labels found.")
+        return
+    print(f"Showing {len(matches)} calibration records")
+    inspect_records(dataset, [record["request_id"] for record in matches])
 
 
 def main() -> None:
     args = parse_args()
+    model = resolve_model(args.provider, args.model)
 
     if not args.input.exists():
         print(f"Input file not found: {args.input}", file=sys.stderr)
@@ -296,6 +324,10 @@ def main() -> None:
 
     if args.inspect is not None:
         inspect_records(dataset, args.inspect)
+        return
+
+    if args.show_calibration:
+        show_calibration(dataset)
         return
 
     if args.show_failures:
@@ -332,9 +364,16 @@ def main() -> None:
         print("Nothing to validate.")
         return
 
-    template = VALIDATE_PROMPT_PATH.read_text(encoding="utf-8")
+    prompt_path = provider_prompt_path(VALIDATE_PROMPT_PATH, args.provider)
+    if not prompt_path.is_file():
+        print(f"Provider prompt not found: {prompt_path}", file=sys.stderr)
+        sys.exit(1)
+    template = prompt_path.read_text(encoding="utf-8")
     custom_vocabulary = VOCABULARY_PATH.read_text(encoding="utf-8").strip()
-    print(f"Validating with {args.model}, parallel={args.parallel}\n")
+    print(
+        f"Validating with {args.provider}/{model}, "
+        f"parallel={args.parallel}\n"
+    )
 
     fail_count = 0
     pass_count = 0
@@ -343,7 +382,10 @@ def main() -> None:
     if args.parallel <= 1:
         for i, record in enumerate(to_validate, 1):
             print(f"[{i}/{len(to_validate)}] Validating {record['request_id']}...")
-            result = validate_one(record, args.model, args.dry_run, template, custom_vocabulary)
+            result = validate_one(
+                record, args.provider, model, args.reasoning_effort,
+                args.dry_run, template, custom_vocabulary,
+            )
             if result is None:
                 errors += 1
                 continue
@@ -357,7 +399,11 @@ def main() -> None:
     else:
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
             futures = {
-                pool.submit(validate_one, record, args.model, args.dry_run, template, custom_vocabulary): record
+                pool.submit(
+                    validate_one, record, args.provider, model,
+                    args.reasoning_effort, args.dry_run, template,
+                    custom_vocabulary,
+                ): record
                 for record in to_validate
             }
             for i, future in enumerate(as_completed(futures), 1):

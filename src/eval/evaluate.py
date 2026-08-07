@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Evaluate baseline vs candidate model on transcription cleanup quality.
 
-Runs both models on the eval dataset, has Claude Sonnet 4.6 judge each pair
-blindly, and aggregates scores to determine a winner.
+Runs both models on the eval dataset, has a configured LLM judge each pair
+blindly, and aggregates scores to determine a winner. Generation artifacts can
+be saved and judged separately so inference never needs to be repeated.
 
 Usage:
     python3 src/eval/evaluate.py --baseline Qwen3.5-4B --candidate Qwen3.5-2B-VoiceInk
@@ -12,10 +13,8 @@ import argparse
 import datetime
 import http.client
 import json
-import os
 import random
 import re
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +22,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
+from common.llm_cli import (
+    EVAL_JUDGE_SCHEMA,
+    SCORE_DIMENSIONS,
+    add_provider_args,
+    call_llm,
+    parse_json_response,
+    provider_metadata,
+    provider_prompt_path,
+    resolve_model,
+)
 DEFAULT_EVAL = ROOT / "datasets" / "eval.jsonl"
 DEFAULT_OUTPUT_DIR = ROOT / "results"
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "judge_prompt.txt"
@@ -49,7 +58,7 @@ def parse_args() -> argparse.Namespace:
                    help=f"Eval dataset JSONL (default: {DEFAULT_EVAL})")
     p.add_argument("--llama-host", default="127.0.0.1")
     p.add_argument("--llama-port", type=int, default=8002)
-    p.add_argument("--judge-model", default="claude-sonnet-4-6")
+    add_provider_args(p, prefix="judge")
     p.add_argument("--parallel", type=int, default=3,
                    help="Parallel judge calls")
     p.add_argument("--limit", type=int, default=0,
@@ -59,12 +68,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a previous eval JSONL (skips already-judged samples)")
+    p.add_argument("--outputs", type=Path, default=None,
+                   help="Judge saved generation/eval JSONL without running local inference")
+    p.add_argument("--generation-output", type=Path, default=None,
+                   help="Path for generated model outputs (default: timestamped in output dir)")
+    p.add_argument("--generate-only", action="store_true",
+                   help="Generate and save model outputs, then exit before judging")
     p.add_argument("--dry-run", action="store_true",
-                   help="Print judge prompts without calling Claude")
+                   help="Print judge prompts without calling the configured provider")
     return p.parse_args()
 
 
 # ---- Data loading ----
+
+def message_text(content) -> str:
+    """Extract text from either text-only or VLM message content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    raise ValueError(f"Unsupported message content type: {type(content).__name__}")
+
 
 def load_eval_data(path: Path) -> list[dict]:
     """Load eval.jsonl and extract messages + gold label."""
@@ -77,10 +105,9 @@ def load_eval_data(path: Path) -> list[dict]:
             record = json.loads(line)
             msgs = record["messages"]
 
-            # Extract plain text from VLM typed content blocks
-            system_text = msgs[0]["content"][0]["text"]
-            user_text = msgs[1]["content"][0]["text"]
-            gold_label = msgs[2]["content"][0]["text"]
+            system_text = message_text(msgs[0]["content"])
+            user_text = message_text(msgs[1]["content"])
+            gold_label = message_text(msgs[2]["content"])
 
             # Extract raw transcript and vocabulary from user message
             m = re.search(r"<TRANSCRIPT>\s*(.*?)\s*</TRANSCRIPT>", user_text, re.DOTALL)
@@ -116,6 +143,30 @@ def load_cached_results(path: Path) -> dict[str, dict]:
             if key and "baseline_scores" in record and "candidate_scores" in record:
                 cache[key] = record
     return cache
+
+
+def load_saved_outputs(path: Path) -> dict[str, dict]:
+    """Load generated outputs from either a generation or completed eval JSONL."""
+    outputs = {}
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            key = record.get("raw_transcript", "")
+            if not key or "baseline_output" not in record or "candidate_output" not in record:
+                continue
+            outputs[key] = {
+                "baseline": {
+                    "text": record["baseline_output"],
+                    "duration_ms": record.get("baseline_duration_ms", 0),
+                },
+                "candidate": {
+                    "text": record["candidate_output"],
+                    "duration_ms": record.get("candidate_duration_ms", 0),
+                },
+            }
+    return outputs
 
 
 # ---- Model inference ----
@@ -159,46 +210,37 @@ def generate_outputs(samples: list[dict], model: str, host: str, port: int) -> l
     return results
 
 
-# ---- Judge ----
-
-def call_claude(prompt: str, model: str) -> str:
-    """Call the Claude CLI and return the response text."""
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    env["CLAUDE_CODE_SKIP_UPDATE_CHECK"] = "1"
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
-    result = subprocess.run(
-        ["claude", "-p", prompt, "--model", model,
-         "--disable-slash-commands", "--allowed-tools", ""],
-        capture_output=True, text=True, timeout=600, env=env,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
 def parse_judge_response(raw: str) -> dict | None:
-    """Extract JSON from judge response, handling markdown fences."""
-    # Strip markdown code fences if present
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+    """Extract and strictly validate a judge response."""
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+        parsed = parse_json_response(raw)
+    except (json.JSONDecodeError, ValueError):
         return None
+    if set(parsed) != {"output_a", "output_b"}:
+        return None
+    for output in (parsed["output_a"], parsed["output_b"]):
+        if not isinstance(output, dict) or set(output) != set(SCORE_DIMENSIONS):
+            return None
+        if any(type(output[dimension]) is not int or not 1 <= output[dimension] <= 5
+               for dimension in SCORE_DIMENSIONS):
+            return None
+    return parsed
 
 
 def judge_one(
     sample: dict,
     baseline_text: str,
     candidate_text: str,
+    judge_provider: str,
     judge_model: str,
+    reasoning_effort: str,
     dry_run: bool,
+    assignment_seed: int,
     seed_offset: int,
     judge_template: str,
 ) -> dict | None:
     """Judge a single sample. Returns structured result or None on failure."""
-    rng = random.Random(42 + seed_offset)
+    rng = random.Random(assignment_seed + seed_offset)
     coin = rng.random() < 0.5
 
     if coin:
@@ -224,7 +266,14 @@ def judge_one(
 
     for attempt in range(2):
         try:
-            raw = call_claude(prompt, judge_model)
+            raw = call_llm(
+                prompt,
+                provider=judge_provider,
+                model=judge_model,
+                reasoning_effort=reasoning_effort,
+                output_schema=EVAL_JUDGE_SCHEMA if judge_provider == "codex" else None,
+                timeout=600,
+            )
         except Exception as exc:
             print(f"  JUDGE ERROR: {exc}", file=sys.stderr)
             return None
@@ -519,9 +568,34 @@ def print_summary(summary: dict) -> None:
     print()
 
 
+def write_generation_outputs(path: Path, samples: list[dict],
+                             baseline_outputs: list[dict],
+                             candidate_outputs: list[dict],
+                             baseline_model: str, candidate_model: str) -> None:
+    """Persist model outputs before any external judging begins."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for index, (sample, baseline, candidate) in enumerate(
+            zip(samples, baseline_outputs, candidate_outputs)
+        ):
+            record = {
+                "sample_index": index,
+                "raw_transcript": sample["raw_transcript"],
+                "gold_label": sample["gold_label"],
+                "baseline_model": baseline_model,
+                "candidate_model": candidate_model,
+                "baseline_output": baseline["text"],
+                "candidate_output": candidate["text"],
+                "baseline_duration_ms": baseline.get("duration_ms", 0),
+                "candidate_duration_ms": candidate.get("duration_ms", 0),
+            }
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"Generated outputs: {path}")
+
+
 def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[dict],
                   candidate_outputs: list[dict], judgments: list[dict],
-                  summary: dict) -> None:
+                  summary: dict, judge_metadata: dict) -> None:
     """Write per-sample results and summary to files."""
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -542,6 +616,7 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
                 "candidate_duration_ms": c_out["duration_ms"],
                 "baseline_scores": judgment["baseline_scores"],
                 "candidate_scores": judgment["candidate_scores"],
+                "judge": judge_metadata,
                 "baseline_weighted": weighted_score(judgment["baseline_scores"]),
                 "candidate_weighted": weighted_score(judgment["candidate_scores"]),
             }
@@ -559,12 +634,15 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
 
 def main() -> None:
     args = parse_args()
+    judge_model = resolve_model(args.judge_provider, args.judge_model)
 
     if not args.eval_data.exists():
         print(f"Eval data not found: {args.eval_data}", file=sys.stderr)
         sys.exit(1)
 
-    random.seed(args.seed)
+    if args.generate_only and args.outputs:
+        print("--generate-only cannot be combined with --outputs", file=sys.stderr)
+        sys.exit(2)
 
     # Load eval samples
     samples = load_eval_data(args.eval_data)
@@ -581,19 +659,15 @@ def main() -> None:
         else:
             print(f"WARNING: resume file not found: {args.resume}")
 
-    # Split samples into cached vs uncached
-    cached_indices = []
-    uncached_indices = []
-    for i, sample in enumerate(samples):
-        if sample["raw_transcript"] in cache:
-            cached_indices.append(i)
-        else:
-            uncached_indices.append(i)
+    cached_indices = [
+        i for i, sample in enumerate(samples)
+        if sample["raw_transcript"] in cache
+    ]
+    uncached_indices = [i for i in range(len(samples)) if i not in cached_indices]
 
     if cache:
         print(f"  {len(cached_indices)} cached, {len(uncached_indices)} to evaluate")
 
-    # Build result arrays — pre-fill from cache
     baseline_outputs = [None] * len(samples)
     candidate_outputs = [None] * len(samples)
     judge_results = {}
@@ -613,49 +687,85 @@ def main() -> None:
             "candidate_scores": c["candidate_scores"],
         }
 
-    # Run inference + judging only for uncached samples
-    if uncached_indices:
+    if args.outputs:
+        if not args.outputs.is_file():
+            print(f"Saved outputs not found: {args.outputs}", file=sys.stderr)
+            sys.exit(1)
+        saved_outputs = load_saved_outputs(args.outputs)
+        missing = []
+        for i in uncached_indices:
+            saved = saved_outputs.get(samples[i]["raw_transcript"])
+            if not saved:
+                missing.append(i)
+                continue
+            baseline_outputs[i] = saved["baseline"]
+            candidate_outputs[i] = saved["candidate"]
+        if missing:
+            print(
+                f"Saved outputs are missing {len(missing)} selected eval samples",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"Loaded outputs for {len(uncached_indices)} samples from {args.outputs}")
+    elif uncached_indices:
         uncached_samples = [samples[i] for i in uncached_indices]
-
-        # Warm up + generate for each model
         warmup_msgs = [{"role": "user", "content": "Hello"}]
 
-        print(f"Warming up {args.baseline}...", end=" ", flush=True)
-        try:
-            _, ms = query_llama(warmup_msgs, args.baseline, args.llama_host, args.llama_port)
-            print(f"{ms:.0f}ms (discarded)")
-        except Exception as exc:
-            print(f"WARNING: warmup failed: {exc}")
+        for model_name, destination in (
+            (args.baseline, baseline_outputs),
+            (args.candidate, candidate_outputs),
+        ):
+            print(f"Warming up {model_name}...", end=" ", flush=True)
+            try:
+                _, milliseconds = query_llama(
+                    warmup_msgs, model_name, args.llama_host, args.llama_port
+                )
+                print(f"{milliseconds:.0f}ms (discarded)")
+            except Exception as exc:
+                print(f"WARNING: warmup failed: {exc}")
 
-        print(f"\nGenerating baseline outputs ({args.baseline})...")
-        b_outs = generate_outputs(uncached_samples, args.baseline, args.llama_host, args.llama_port)
+            print(f"\nGenerating outputs ({model_name})...")
+            generated = generate_outputs(
+                uncached_samples, model_name, args.llama_host, args.llama_port
+            )
+            for position, sample_index in enumerate(uncached_indices):
+                destination[sample_index] = generated[position]
 
-        print(f"\nWarming up {args.candidate}...", end=" ", flush=True)
-        try:
-            _, ms = query_llama(warmup_msgs, args.candidate, args.llama_host, args.llama_port)
-            print(f"{ms:.0f}ms (discarded)")
-        except Exception as exc:
-            print(f"WARNING: warmup failed: {exc}")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        generation_path = args.generation_output or (
+            args.output_dir / f"generations_{timestamp}.jsonl"
+        )
+        write_generation_outputs(
+            generation_path, samples, baseline_outputs, candidate_outputs,
+            args.baseline, args.candidate,
+        )
 
-        print(f"\nGenerating candidate outputs ({args.candidate})...")
-        c_outs = generate_outputs(uncached_samples, args.candidate, args.llama_host, args.llama_port)
+    if args.generate_only:
+        print("Generation-only run complete; no judge was called.")
+        return
 
-        for j, i in enumerate(uncached_indices):
-            baseline_outputs[i] = b_outs[j]
-            candidate_outputs[i] = c_outs[j]
-
-        # Judge uncached pairs
-        judge_template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
-        print(f"\nJudging {len(uncached_indices)} new outputs ({args.judge_model})...")
-        errors = 0
+    errors = 0
+    if uncached_indices:
+        prompt_path = provider_prompt_path(JUDGE_PROMPT_PATH, args.judge_provider)
+        if not prompt_path.is_file():
+            print(f"Judge prompt not found: {prompt_path}", file=sys.stderr)
+            sys.exit(1)
+        judge_template = prompt_path.read_text(encoding="utf-8")
+        print(
+            f"\nJudging {len(uncached_indices)} new outputs "
+            f"({args.judge_provider}/{judge_model}, "
+            f"effort={args.judge_reasoning_effort})..."
+        )
 
         if args.parallel <= 1 or args.dry_run:
             for j, i in enumerate(uncached_indices):
                 print(f"  [{j+1}/{len(uncached_indices)}]", end=" ")
-                result = judge_one(samples[i], baseline_outputs[i]["text"],
-                                  candidate_outputs[i]["text"],
-                                  args.judge_model, args.dry_run, i,
-                                  judge_template)
+                result = judge_one(
+                    samples[i], baseline_outputs[i]["text"],
+                    candidate_outputs[i]["text"], args.judge_provider,
+                    judge_model, args.judge_reasoning_effort, args.dry_run,
+                    args.seed, i, judge_template,
+                )
                 judge_results[i] = result
                 if not result:
                     errors += 1
@@ -663,11 +773,12 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.parallel) as pool:
                 futures = {}
                 for j, i in enumerate(uncached_indices):
-                    fut = pool.submit(judge_one, samples[i],
-                                      baseline_outputs[i]["text"],
-                                      candidate_outputs[i]["text"],
-                                      args.judge_model, False, i,
-                                      judge_template)
+                    fut = pool.submit(
+                        judge_one, samples[i], baseline_outputs[i]["text"],
+                        candidate_outputs[i]["text"], args.judge_provider,
+                        judge_model, args.judge_reasoning_effort, False,
+                        args.seed, i, judge_template,
+                    )
                     futures[fut] = i
 
                 done_count = 0
@@ -684,7 +795,6 @@ def main() -> None:
                     if not result:
                         errors += 1
     else:
-        errors = 0
         print("\nAll samples cached, skipping inference and judging.")
 
     if args.dry_run:
@@ -709,11 +819,16 @@ def main() -> None:
     # Aggregate and print
     summary = aggregate(filtered_judgments, filtered_baseline, filtered_candidate,
                         args.baseline, args.candidate)
+    judge_metadata = provider_metadata(
+        args.judge_provider, judge_model, args.judge_reasoning_effort
+    )
+    summary["judge"] = judge_metadata
     print_summary(summary)
 
     # Write results
     write_results(args.output_dir, filtered_samples, filtered_baseline,
-                  filtered_candidate, filtered_judgments, summary)
+                  filtered_candidate, filtered_judgments, summary,
+                  judge_metadata)
 
 
 if __name__ == "__main__":

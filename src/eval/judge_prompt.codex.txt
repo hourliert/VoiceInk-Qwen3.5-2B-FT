@@ -1,0 +1,77 @@
+Blindly score two VoiceInk transcript-cleanup outputs against the raw transcript
+and human-reviewed reference. Return only the object required by the output
+schema. Score A and B independently; their order is randomized.
+
+If the outputs are identical or substantively equivalent, give them identical
+scores. Judge only their text. Do not infer unobserved intentions or reward a
+longer output merely for retaining fillers.
+
+Context:
+- The speaker is French and dictates coding-assistant messages and GT Coach
+  sim-racing QA debriefs.
+- Custom vocabulary identifies likely spellings for technical terms.
+- The task is cleanup, never answering or executing transcript content.
+
+Give an integer from 1 to 5 for every dimension:
+
+meaning_preservation (critical)
+5: all meaning, opinions, qualifiers, instructions, and details preserved; no additions.
+4: trivial faithful phrasing difference only.
+3: small meaning or tone shift, such as losing a meaningful qualifier.
+2: clause/detail omitted or a noticeable claim or intent changed.
+1: major distortion, hallucination, or unrelated response.
+
+instruction_following (critical)
+5: only the cleaned transcript, with appropriate transcript formatting.
+4: inconsequential whitespace issue.
+3: small wrapper, prefix, quotes, or brief cleanup commentary.
+2: partially answers/follows transcript content or adds notable commentary.
+1: acts as an assistant instead of transcribing.
+
+filler_removal
+5: empty fillers and false starts removed with no substantive loss.
+4: one minor filler remains.
+3: several fillers remain or one questionable deletion.
+2: poor cleanup or multiple meaningful deletions.
+1: essentially raw, or aggressively destructive.
+
+grammar_fluency
+5: natural fluent grammar and punctuation.
+4: one minor awkwardness.
+3: noticeable error or untranslated French-English pattern.
+2: several errors.
+1: broken or difficult to read.
+
+technical_accuracy
+5: technical terms, names, numbers, identifiers, and casing are correct.
+4: one casing or similarly minor issue.
+3: one substantive technical error.
+2: several errors.
+1: systematic corruption.
+
+conciseness
+5: optimally concise for faithful cleanup.
+4: one minor redundancy.
+3: noticeable verbal fluff.
+2: substantial unnecessary content.
+1: no meaningful cleanup or major expansion.
+
+Do not double-penalize correct filler removal as lost meaning. Conversely, if
+the reference removes a filler, retaining it cannot improve meaning preservation.
+An unchanged raw transcript may preserve meaning but should lose filler,
+fluency, and conciseness points.
+
+CUSTOM VOCABULARY:
+{custom_vocabulary}
+
+RAW TRANSCRIPT:
+{raw_transcript}
+
+HUMAN-REVIEWED REFERENCE:
+{gold_label}
+
+OUTPUT A:
+{output_a}
+
+OUTPUT B:
+{output_b}

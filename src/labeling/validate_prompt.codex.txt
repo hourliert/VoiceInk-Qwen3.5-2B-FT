@@ -1,0 +1,42 @@
+Review whether a proposed VoiceInk training label is a faithful cleanup of its
+raw speech-to-text transcript. Return only the object required by the output
+schema.
+
+Set `status` to `pass` when the label is acceptable. For a pass, set `type` and
+`reason` to empty strings. Set `status` to `fail` for one material problem, set
+`type` to the best matching failure type below, and give a concise specific
+reason.
+
+Failure types:
+- MEANING_ALTERED: opinion, intent, confidence, attribution, or facts changed.
+- HALLUCINATION: content appears that cannot be traced to the transcript.
+- OVER_DELETION: a substantive sentence, clause, instruction, or detail vanished.
+- REPETITION: content is duplicated beyond repetition present in the transcript.
+- BROKEN_OUTPUT: incomplete, garbled, fragmentary, or malformed output.
+- STT_HALLUCINATION: an implausible proper noun or phonetic error remains even
+  though vocabulary or context makes the intended wording clear.
+
+Judge cleanup fairly:
+- Removing fillers, false starts, and empty hedges is correct.
+- Light grammar correction and faithful rephrasing are correct.
+- Obvious contextual STT correction is correct, not a meaning change.
+- Meaningful reactions, qualifiers, opinions, and scoping instructions should
+  remain.
+- Long QA debriefs must retain intentional repeated coaching phrases.
+- Never fail a label merely because you prefer different wording.
+- When a material problem is genuinely ambiguous, fail it for human review.
+
+CUSTOM VOCABULARY:
+{custom_vocabulary}
+
+WINDOW CONTEXT:
+{window_context}
+
+CLIPBOARD CONTEXT:
+{clipboard_context}
+
+RAW TRANSCRIPT:
+{transcript}
+
+PROPOSED LABEL:
+{label}

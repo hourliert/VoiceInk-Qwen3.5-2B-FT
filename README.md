@@ -21,7 +21,7 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
                     ┌─────────────┼──────────────┐
                     ▼             ▼              ▼
               Label with    Generate         Evaluate
-              Claude judge  synthetic data   A/B with judge
+              LLM provider  synthetic data   A/B with judge
                     │             │              │
                     ▼             ▼              ▼
               datasets/     datasets/        results/
@@ -48,7 +48,12 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
 
 ## The fine-tuning pipeline
 
-The entire fine-tuning pipeline — from raw proxy logs to a deployed GGUF model — is built with Python (standard library only, no pip dependencies for the pipeline scripts) and [Claude](https://claude.ai) as an LLM judge via the [Claude CLI](https://github.com/anthropics/claude-code).
+The pipeline scripts use Python's standard library and support either Claude CLI
+or Codex CLI for labeling, validation, synthetic generation, and evaluation.
+Claude remains the default for backwards compatibility; Codex defaults to
+`gpt-5.6-luna` with low reasoning and a fresh ephemeral session per sample.
+Each provider has its own prompt file so its instructions and output format can
+be tuned independently.
 
 ### 1. Data collection
 
@@ -72,9 +77,13 @@ The proxy logs these verbatim to `logs/voiceink_proxy_requests.jsonl`. A shared 
 ```bash
 python3 src/labeling/label.py --parallel 5
 python3 src/labeling/label.py --limit 50 --force  # relabel a subset
+python3 src/labeling/label.py --provider codex --parallel 3
 ```
 
-The labeling script sends each logged transcript to **Claude Sonnet 4.6** with a detailed judge prompt (`src/labeling/judge_prompt.txt`) that specifies exactly how to clean the transcript. Claude produces the gold-standard label — the ideal cleaned version of each transcript.
+The labeling script sends each logged transcript to the configured provider,
+which produces the gold-standard cleaned transcript. Claude uses the legacy
+`src/labeling/judge_prompt.txt`; Codex uses the separately maintained
+`src/labeling/judge_prompt.codex.txt` and a strict JSON schema.
 
 The judge prompt encodes rules for:
 - Filler word removal ("so", "like", "basically", "um")
@@ -83,17 +92,38 @@ The judge prompt encodes rules for:
 - Word splitting recombination ("voice ink" → "VoiceInk")
 - Preserving meaning, tone, and speaker opinions faithfully
 
-Output: `datasets/labeled.jsonl` — each record contains the original request, the model's original response, and Claude's gold-standard label. Dedup-safe by `request_id`.
+Output: `datasets/labeled.jsonl` — each record contains the original request,
+the model's original response, provider provenance, and the gold-standard
+label. It is dedup-safe by `request_id`.
+
+To calibrate a new provider against existing labels without touching the main
+dataset:
+
+```bash
+python3 src/labeling/label.py \
+  --provider codex --model gpt-5.6-luna --reasoning-effort low \
+  --reference-labels datasets/labeled.jsonl \
+  --output datasets/calibration/luna56-low.jsonl \
+  --shuffle --seed 42 --limit 20 --parallel 3
+
+python3 src/labeling/validate.py \
+  --input datasets/calibration/luna56-low.jsonl --show-calibration
+```
 
 #### Label validation
 
 ```bash
 python3 src/labeling/validate.py --parallel 10
+python3 src/labeling/validate.py --provider codex --parallel 3
 python3 src/labeling/validate.py --show-failures       # review flagged records
 python3 src/labeling/validate.py --force --parallel 10  # re-validate all
 ```
 
-A lightweight quality gate that runs each label through **Claude Sonnet 4.6** to check for meaning alteration, hallucination, over-deletion, repetition, or broken output. Results are written back into `labeled.jsonl` as a `validation` field on each record. Already-validated records are skipped unless `--force` is set.
+A lightweight quality gate checks each label for meaning alteration,
+hallucination, over-deletion, repetition, or broken output. Claude uses
+`validate_prompt.txt`; Codex uses `validate_prompt.codex.txt`. Results are
+written back into `labeled.jsonl` as a `validation` field. Already-validated
+records are skipped unless `--force` is set.
 
 `prepare_dataset.py` automatically excludes records where `validation.status == "fail"` (override with `--include-failed`).
 
@@ -101,11 +131,15 @@ A lightweight quality gate that runs each label through **Claude Sonnet 4.6** to
 
 ```bash
 python3 src/synthetic/generate.py --count 160 --parallel 5
+python3 src/synthetic/generate.py --provider codex --count 20 --parallel 3
 ```
 
 The fine-tuned model initially failed on long QA debrief transcripts (500-3500 words) — it amplified repetitive coaching phrases and filled the entire 16K context window. The root cause: only 10 long samples existed in 1,451 training records.
 
-The synthetic generator uses Claude Sonnet 4.6 to produce realistic QA debrief transcripts for [GT Coach](https://gtcoach.app) (a sim-racing coaching app). Each sample includes:
+The synthetic generator uses the configured provider to produce realistic QA
+debrief transcripts for [GT Coach](https://gtcoach.app) (a sim-racing coaching
+app). Claude and Codex use separate `generator_prompt.txt` and
+`generator_prompt.codex.txt` templates. Each sample includes:
 - Naturally repetitive corner-by-corner coaching phrases ("Corner 2, brake one beat earlier. It carried into corner 3. Your mid-corner speed is down.")
 - Realistic STT errors at proper density
 - Speaker narration interleaved with coaching feedback
@@ -185,10 +219,10 @@ and completions-only loss. Run a one-step smoke test before the full job; use
 python3 src/eval/evaluate.py --baseline Qwen3.5-4B --candidate Qwen3.5-2B-VoiceInk
 ```
 
-Runs blind A/B evaluation using Claude Sonnet 4.6 as judge. For each eval sample:
+Runs blind A/B evaluation using the configured judge provider. For each eval sample:
 1. Both models generate a cleaned transcript
 2. Outputs are randomly assigned as "Response A" / "Response B"
-3. Claude scores each on 6 weighted dimensions
+3. The judge scores each on 6 weighted dimensions
 
 **Scoring rubric** (from `src/eval/judge_prompt.txt`):
 
@@ -201,7 +235,21 @@ Runs blind A/B evaluation using Claude Sonnet 4.6 as judge. For each eval sample
 | Technical accuracy | 2x | Are technical terms, names, numbers correct? |
 | Conciseness | 1x | Is unnecessary verbosity removed? |
 
-Supports `--resume` for interrupted evaluations and `--parallel` for concurrent judge calls.
+Supports `--resume` for interrupted evaluations and `--parallel` for
+concurrent judge calls. Generation and judging can also be split, which avoids
+keeping local inference models loaded while external judges run:
+
+```bash
+python3 src/eval/evaluate.py \
+  --baseline Qwen3.5-2B-VoiceInk --candidate LFM2.5-1.2B-VoiceInk \
+  --generate-only --generation-output results/lfm25-generations.jsonl
+
+python3 src/eval/evaluate.py \
+  --baseline Qwen3.5-2B-VoiceInk --candidate LFM2.5-1.2B-VoiceInk \
+  --outputs results/lfm25-generations.jsonl \
+  --judge-provider codex --judge-model gpt-5.6-luna \
+  --judge-reasoning-effort low --parallel 3
+```
 
 ## Results
 
@@ -260,21 +308,22 @@ docs/
 src/
   voiceink_proxy/server.py       # Reverse proxy with JSONL logging
   common/extract.py              # Structured XML extraction from requests
+  common/llm_cli.py              # Claude/Codex CLI provider adapters
   labeling/
-    label.py                     # Gold-standard label generation (Claude judge)
-    judge_prompt.txt             # Labeling judge prompt
-    validate.py                  # Label quality validation (Haiku reviewer)
-    validate_prompt.txt          # Validation reviewer prompt
+    label.py                     # Gold-standard label generation
+    judge_prompt*.txt            # Provider-specific labeling prompts
+    validate.py                  # Label quality validation
+    validate_prompt*.txt         # Provider-specific validation prompts
   synthetic/
     generate.py                  # Synthetic QA debrief generator
-    generator_prompt.txt         # Generator prompt template
+    generator_prompt*.txt        # Provider-specific generator prompts
   training/
     show_distribution.py         # Dataset distribution by input word count
     prepare_dataset.py           # Convert labels to training format
     finetune.py                  # Unsloth LoRA fine-tuning + GGUF export
   eval/
     evaluate.py                  # A/B evaluation pipeline
-    judge_prompt.txt             # Evaluation scoring rubric
+    judge_prompt*.txt            # Provider-specific evaluation rubrics
 Modelfile                            # Ollama model definition
 datasets/                        # Training data (gitignored, *.jsonl)
 models/                          # GGUF model files (gitignored)
@@ -289,7 +338,7 @@ results/                         # Evaluation results (gitignored)
 - Linux machine with NVIDIA GPU (16GB+ VRAM recommended)
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) built with CUDA support
 - Python 3.12+ with a venv containing [Unsloth](https://github.com/unslothai/unsloth) and PyTorch
-- [Claude CLI](https://github.com/anthropics/claude-code) installed and authenticated (for labeling, synthetic data, and evaluation)
+- Claude CLI and/or Codex CLI installed and authenticated for provider-backed workflows
 - A Qwen 3.5 2B base model in GGUF format
 
 ### Steps
@@ -406,5 +455,6 @@ VoiceInk sends its own system prompt with each request (overriding the Modelfile
 - [Unsloth](https://github.com/unslothai/unsloth) — LoRA fine-tuning
 - [Qwen 3.5](https://huggingface.co/Qwen) — Base model family
 - [Claude](https://claude.ai) via [Claude CLI](https://github.com/anthropics/claude-code) — Labeling judge, synthetic data generation, evaluation judge
+- [OpenAI Codex](https://developers.openai.com/codex) — Optional ephemeral labeling, validation, generation, and evaluation provider
 - [VoiceInk](https://voiceink.app) — macOS dictation app (the client)
 - [GT Coach](https://gtcoach.app) — Sim-racing coaching app (source of QA debrief transcripts)

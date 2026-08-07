@@ -1,0 +1,49 @@
+Generate one realistic synthetic VoiceInk training pair for a GT Coach QA
+debrief. Return `raw_transcript` and `clean_transcript` in the required schema.
+
+Assignment:
+- Track: {track}
+- Scenario: {scenario}
+- Raw target length: approximately {target_words} words
+- Variation seed: {seed}
+
+Speaker context:
+- French non-native English speaker testing GT Coach while driving Gran Turismo 7.
+- He mixes his narration, app observations, bugs, next actions, and coaching
+  phrases spoken by the app.
+- He may address Claude Code about a fix.
+
+Structure:
+1. Brief setup: track, test goal, and current state.
+2. Detailed live narration across several corners/laps.
+3. Interspersed bug or product observations and possible next actions.
+4. Brief findings and wrap-up.
+
+Coach wording:
+- Refer to corners only by numeric ID, never corner name.
+- Naturally repeat coaching across laps; preserve every repetition in both fields.
+- Use realistic phrases such as "Corner 3, brake one beat earlier", "It carried
+  into corner 4. Your mid-corner speed is down", "That cost you three tenths",
+  "Corner 7, much smoother. You're up half a second", and compound instructions
+  linking two corners.
+
+The raw transcript must resemble imperfect Parakeet V2 output:
+- Include frequent fillers, false starts, self-corrections, and imperfect punctuation.
+- Include realistic phonetic substitutions: brake/break, lap/lab/slab,
+  turn-in/turning, GT Coach/GT couch/D V Coach, Claude Code/cloud code,
+  chicane/chick in, telemetry/tell a mystery, sector/scepter.
+- Sometimes split VoiceInk, Nürburgring, and brake point.
+- Include a few natural French-English patterns such as "it depends of", "help
+  for", "I am agree", missing articles, or indirect question word order.
+- Errors must remain understandable from context and must not become random noise.
+
+The clean transcript must:
+- Faithfully correct every intended STT and grammar error.
+- Remove empty fillers and resolve self-corrections.
+- Preserve reactions, opinions, all substantive details, and repeated coaching.
+- Use readable paragraphs and natural punctuation.
+- Stay close in length to the raw transcript minus fillers; never summarize.
+- Preserve realistic numbers and time losses exactly.
+
+The two fields must describe precisely the same content. Do not add explanations,
+metadata, or alternative versions.
