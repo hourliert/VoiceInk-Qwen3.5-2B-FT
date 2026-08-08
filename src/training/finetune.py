@@ -17,7 +17,9 @@ Usage:
 """
 import argparse
 import filecmp
+import hashlib
 import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -31,7 +33,7 @@ DEFAULT_OUTPUT_DIR = ROOT / "training" / "outputs"
 DEFAULT_GGUF_DIR = ROOT / "models"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fine-tune Qwen 3.5 2B with Unsloth.")
 
     # Data
@@ -62,14 +64,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=10, help="Warmup steps")
     p.add_argument("--max-steps", type=int, default=-1,
                    help="Max training steps (-1 = use epochs)")
+    p.add_argument("--eval-steps", type=int, default=50,
+                   help="Run loss-only evaluation every N training steps")
+    p.add_argument("--save-steps", type=int, default=25,
+                   help="Save a resumable checkpoint every N training steps")
+    p.add_argument(
+        "--resume-from-checkpoint", type=Path,
+        help="Resume model, optimizer, scheduler, and trainer state from a checkpoint",
+    )
 
     # Output
     p.add_argument("--lora-dir", type=Path, default=DEFAULT_LORA_DIR)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--export-gguf", nargs="*", default=None,
                    help="Export to GGUF after training. Quantization methods, e.g.: q4_k_m q8_0")
+    p.add_argument(
+        "--gguf-base", type=Path,
+        default=DEFAULT_GGUF_DIR / "Qwen3.5-2B-voiceink",
+        help="Base export path; Unsloth appends _gguf",
+    )
+    p.add_argument(
+        "--check-only", action="store_true",
+        help="Validate and print the training configuration without loading a model",
+    )
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def snapshot_labeled_data() -> str | None:
@@ -113,12 +132,121 @@ def load_dataset_jsonl(path: Path) -> list[dict]:
     return records
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_conversations(records: list[dict], path: Path) -> None:
+    """Fail closed on malformed Qwen typed-content conversations."""
+    expected_roles = ["system", "user", "assistant"]
+    for index, record in enumerate(records):
+        messages = record.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError(f"{path}:{index + 1} has no messages list")
+        if [message.get("role") for message in messages] != expected_roles:
+            raise ValueError(f"{path}:{index + 1} has unexpected message roles")
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list) or not content:
+                raise ValueError(
+                    f"{path}:{index + 1} requires non-empty typed content blocks"
+                )
+            if not any(
+                isinstance(block, dict) and block.get("type") == "text"
+                and str(block.get("text", "")).strip()
+                for block in content
+            ):
+                raise ValueError(f"{path}:{index + 1} has no non-empty text block")
+
+
+def print_preflight(args: argparse.Namespace, train_data: list[dict],
+                    eval_data: list[dict] | None) -> None:
+    precision = "4-bit" if args.load_in_4bit else (
+        "8-bit" if args.load_in_8bit else "BF16"
+    )
+    quant_methods = args.export_gguf if args.export_gguf is not None else []
+    print("Qwen3.5 training preflight")
+    print(f"  Base model: {args.base_model}")
+    print(
+        f"  Train: {args.train} ({len(train_data)} samples, "
+        f"sha256={sha256_file(args.train)})"
+    )
+    if eval_data is not None:
+        print(
+            f"  Eval: {args.eval} ({len(eval_data)} samples, "
+            f"sha256={sha256_file(args.eval)})"
+        )
+    else:
+        print("  Eval: disabled")
+    print(f"  Max sequence length: {args.max_seq_length}")
+    print(f"  LoRA: r={args.r}, alpha={args.lora_alpha}")
+    print(
+        f"  Effective batch size: {args.batch_size * args.grad_accum} "
+        f"({args.batch_size} x {args.grad_accum})"
+    )
+    print(f"  Epochs: {args.epochs}; max steps: {args.max_steps}")
+    print(f"  Learning rate: {args.lr}; warmup steps: {args.warmup_steps}")
+    print(
+        f"  Evaluation: loss-only every {args.eval_steps} steps; "
+        f"checkpoint every {args.save_steps} steps"
+    )
+    if args.resume_from_checkpoint:
+        print(f"  Resume checkpoint: {args.resume_from_checkpoint}")
+    print(f"  Load precision: {precision}")
+    print(f"  Adapter output: {args.lora_dir}")
+    print(f"  Checkpoints: {args.output_dir}")
+    if args.export_gguf is None:
+        print("  GGUF export: disabled")
+    else:
+        methods = quant_methods or ["q4_k_m"]
+        print(f"  GGUF export: {args.gguf_base}_gguf ({', '.join(methods)})")
+
+
+def compute_fused_eval_loss(trainer, model, inputs, torch_module):
+    """Compute eval loss while explicitly keeping Unsloth logits disabled."""
+    inputs = trainer._prepare_inputs(inputs)
+    previous = os.environ.get("UNSLOTH_RETURN_LOGITS")
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "0"
+    try:
+        with torch_module.no_grad():
+            with trainer.compute_loss_context_manager():
+                loss = trainer.compute_loss(model, inputs, return_outputs=False)
+        return loss.mean().detach(), None, None
+    finally:
+        if previous is None:
+            os.environ.pop("UNSLOTH_RETURN_LOGITS", None)
+        else:
+            os.environ["UNSLOTH_RETURN_LOGITS"] = previous
+
+
 def main() -> None:
     args = parse_args()
 
     if not args.train.exists():
         print(f"Training data not found: {args.train}", file=sys.stderr)
         sys.exit(1)
+
+    if args.load_in_4bit and args.load_in_8bit:
+        print("Use only one of --load-in-4bit or --load-in-8bit", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"Loading training data from {args.train}")
+    train_data = load_dataset_jsonl(args.train)
+    validate_conversations(train_data, args.train)
+
+    eval_data = None
+    if args.eval and args.eval.is_file():
+        eval_data = load_dataset_jsonl(args.eval)
+        validate_conversations(eval_data, args.eval)
+
+    print_preflight(args, train_data, eval_data)
+    if args.check_only:
+        print("Preflight complete; no model was loaded and no training was run.")
+        return
 
     # Snapshot labeled data for reproducibility
     snapshot_labeled_data()
@@ -152,16 +280,6 @@ def main() -> None:
         use_rslora=False,
     )
 
-    # ---- Load dataset ----
-    print(f"Loading training data from {args.train}")
-    train_data = load_dataset_jsonl(args.train)
-    print(f"  {len(train_data)} training samples")
-
-    eval_data = None
-    if args.eval and args.eval.is_file():
-        eval_data = load_dataset_jsonl(args.eval)
-        print(f"  {len(eval_data)} eval samples")
-
     # ---- Train ----
     from unsloth.trainer import UnslothVisionDataCollator
     from trl import SFTTrainer, SFTConfig
@@ -170,7 +288,24 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    trainer = SFTTrainer(
+    class LossOnlyEvalSFTTrainer(SFTTrainer):
+        """Evaluate fused cross-entropy without materializing vocabulary logits.
+
+        Unsloth's generic prediction step forces UNSLOTH_RETURN_LOGITS=1 even
+        when Transformers requests loss only. For Qwen3.5's 248k vocabulary,
+        a long eval example can make that temporary tensor exceed GPU memory.
+        """
+
+        def prediction_step(
+            self, model, inputs, prediction_loss_only, ignore_keys=None
+        ):
+            if not prediction_loss_only:
+                return super().prediction_step(
+                    model, inputs, prediction_loss_only, ignore_keys
+                )
+            return compute_fused_eval_loss(self, model, inputs, torch)
+
+    trainer = LossOnlyEvalSFTTrainer(
         model=model,
         tokenizer=tokenizer,
         data_collator=UnslothVisionDataCollator(
@@ -198,9 +333,14 @@ def main() -> None:
             report_to="none",
             # Evaluation during training (detect overfitting)
             eval_strategy="steps" if eval_data else "no",
-            eval_steps=50,
+            eval_steps=args.eval_steps,
+            prediction_loss_only=True,
             fp16_full_eval=not args.load_in_4bit,
             per_device_eval_batch_size=1,
+            # Save before the first evaluation so interruptions are resumable.
+            save_strategy="steps",
+            save_steps=args.save_steps,
+            save_total_limit=2,
             # Required for vision finetuning:
             remove_unused_columns=False,
             dataset_text_field="",
@@ -215,7 +355,10 @@ def main() -> None:
     print(f"\nGPU: {gpu_stats.name} — {max_memory} GB total, {start_gpu_memory} GB reserved")
     print("Starting training...\n")
 
-    trainer_stats = trainer.train()
+    resume_checkpoint = (
+        str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    )
+    trainer_stats = trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     # Report stats
     used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
@@ -236,7 +379,7 @@ def main() -> None:
         quant_methods = args.export_gguf if args.export_gguf else ["q4_k_m"]
         # Unsloth appends "_gguf" to the path, so we use a base name
         # that produces the final directory we want.
-        gguf_base = DEFAULT_GGUF_DIR / "Qwen3.5-2B-voiceink"
+        gguf_base = args.gguf_base
         gguf_final = Path(str(gguf_base) + "_gguf")
 
         # Back up existing GGUF files before overwriting (v1, v2, v3, ...)

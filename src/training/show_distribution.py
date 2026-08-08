@@ -22,6 +22,13 @@ BUCKETS = [
 ]
 
 
+def is_training_approved(record):
+    return (
+        bool(record.get("manually_reviewed"))
+        or (record.get("auto_review") or {}).get("status") == "approved"
+    )
+
+
 def load_records(path, require_reviewed=False):
     records = []
     with open(path) as f:
@@ -29,7 +36,7 @@ def load_records(path, require_reviewed=False):
             line = line.strip()
             if line:
                 r = json.loads(line)
-                if require_reviewed and not r.get("manually_reviewed"):
+                if require_reviewed and not is_training_approved(r):
                     continue
                 records.append(r)
     return records

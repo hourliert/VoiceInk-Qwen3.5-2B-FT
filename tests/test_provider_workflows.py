@@ -11,6 +11,7 @@ from src.eval.evaluate import (
     load_saved_outputs,
     message_text,
     parse_judge_response,
+    select_sample_indices,
 )
 from src.labeling.label import load_logs, load_reference_labels
 
@@ -43,6 +44,31 @@ class ProviderWorkflowTests(unittest.TestCase):
 
         self.assertEqual(sample["raw_transcript"], "Hello")
         self.assertEqual(sample["gold_label"], "Hello.")
+        self.assertEqual(sample["window_context"], "")
+        self.assertEqual(sample["clipboard_context"], "")
+
+    def test_eval_loader_extracts_model_context_for_judge(self) -> None:
+        path = self.write_jsonl([{
+            "messages": [
+                {"role": "system", "content": "system"},
+                {
+                    "role": "user",
+                    "content": (
+                        "<CURRENT_WINDOW_CONTEXT>electron-mocks.ts</CURRENT_WINDOW_CONTEXT>"
+                        "<CLIPBOARD_CONTEXT>reportZonePlanResults</CLIPBOARD_CONTEXT>"
+                        "<CUSTOM_VOCABULARY>VoiceInk</CUSTOM_VOCABULARY>"
+                        "<TRANSCRIPT>Electron Mox</TRANSCRIPT>"
+                    ),
+                },
+                {"role": "assistant", "content": "electron-mocks.ts"},
+            ]
+        }])
+
+        sample = load_eval_data(path)[0]
+
+        self.assertEqual(sample["window_context"], "electron-mocks.ts")
+        self.assertEqual(sample["clipboard_context"], "reportZonePlanResults")
+        self.assertEqual(sample["custom_vocabulary"], "VoiceInk")
 
     def test_eval_loader_uses_last_transcript_tag_pair(self) -> None:
         path = self.write_jsonl([{
@@ -65,6 +91,17 @@ class ProviderWorkflowTests(unittest.TestCase):
 
         self.assertEqual(sample["raw_transcript"], "Actual dictated text.")
 
+    def test_select_sample_indices_preserves_requested_order(self) -> None:
+        samples = [{"sample_index": index} for index in range(4)]
+
+        selected = select_sample_indices(samples, "3, 1")
+
+        self.assertEqual([sample["sample_index"] for sample in selected], [3, 1])
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            select_sample_indices(samples, "1,1")
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            select_sample_indices(samples, "4")
+
     def test_judge_response_requires_every_integer_score(self) -> None:
         scores = {
             "meaning_preservation": 5,
@@ -83,6 +120,29 @@ class ProviderWorkflowTests(unittest.TestCase):
 
         self.assertIsNotNone(parse_judge_response(valid))
         self.assertIsNone(parse_judge_response(missing))
+
+    def test_codex_judge_response_requires_context_analysis(self) -> None:
+        scores = {dimension: 5 for dimension in SCORE_DIMENSIONS}
+        without_analysis = json.dumps({"output_a": scores, "output_b": scores})
+        with_analysis = json.dumps({
+            "output_a": scores,
+            "output_b": scores,
+            "context_analysis": {
+                "output_a": "Supported code change from the code-related window.",
+                "output_b": "Retains the unsupported ASR wording cold change.",
+            },
+            "score_analysis": {
+                "output_a": "No material scoring issue.",
+                "output_b": "Technical accuracy: retains cold change.",
+            },
+        })
+
+        self.assertIsNone(parse_judge_response(
+            without_analysis, require_context_analysis=True
+        ))
+        self.assertIsNotNone(parse_judge_response(
+            with_analysis, require_context_analysis=True
+        ))
 
     def test_saved_outputs_accept_completed_eval_files(self) -> None:
         path = self.write_jsonl([{

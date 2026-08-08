@@ -6,8 +6,9 @@ hallucinations, meaning changes, over-deletions, repetitions, or broken output.
 Results are written back into the labeled JSONL file as a "validation" field
 on each record.
 
-Designed as a quality gate between labeling and training — prepare_dataset.py
-skips records where validation.status == "fail".
+Designed as a quality gate between labeling and training. Validation does not
+approve a record for training: prepare_dataset.py still requires an explicit
+manual-review flag for non-synthetic records.
 
 Usage:
     python3 src/labeling/validate.py --parallel 10
@@ -35,6 +36,7 @@ from common.llm_cli import (
     provider_prompt_path,
     resolve_model,
 )
+from labeling.label import load_id_prefixes
 
 DEFAULT_INPUT = ROOT / "datasets" / "labeled.jsonl"
 VALIDATE_PROMPT_PATH = Path(__file__).resolve().parent / "validate_prompt.txt"
@@ -84,6 +86,22 @@ class LabeledDataset:
                 self._records[request_id]["validation"] = validation
                 self._flush()
 
+    def mark_reviewed_exact(self, request_ids: set[str]) -> int:
+        """Mark an exact, fully present request-ID set as manually reviewed."""
+        with self._lock:
+            missing_ids = sorted(request_ids - self._records.keys())
+            if missing_ids:
+                raise ValueError("\n".join(missing_ids))
+            updated = 0
+            for request_id in request_ids:
+                record = self._records[request_id]
+                if not record.get("manually_reviewed"):
+                    record["manually_reviewed"] = True
+                    updated += 1
+            if updated:
+                self._flush()
+            return updated
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._records)
@@ -102,6 +120,8 @@ def parse_args() -> argparse.Namespace:
                    help="Print prompts without calling the configured provider")
     p.add_argument("--ids", nargs="*", default=None,
                    help="Validate only these specific request IDs (prefix match)")
+    p.add_argument("--ids-file", type=Path, default=None,
+                   help="Read request IDs from a text file or JSONL manifest")
     p.add_argument("--force", action="store_true",
                    help="Re-validate records that already have a validation field")
     p.add_argument("--shuffle", action="store_true",
@@ -113,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--inspect", nargs="*", default=None,
                    help="Show transcript, label, and validation for given IDs (prefix match)")
     p.add_argument("--mark-reviewed", action="store_true",
-                   help="Mark all records as manually_reviewed and exit")
+                   help="Mark only exact IDs supplied with --ids or --ids-file as manually reviewed")
     return p.parse_args()
 
 
@@ -300,6 +320,21 @@ def main() -> None:
     args = parse_args()
     model = resolve_model(args.provider, args.model)
 
+    if args.ids is not None and args.ids_file is not None:
+        print("Use only one of --ids or --ids-file", file=sys.stderr)
+        sys.exit(1)
+    id_prefixes = args.ids
+    if args.ids_file is not None:
+        if not args.ids_file.is_file():
+            print(f"ID file not found: {args.ids_file}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            id_prefixes = load_id_prefixes(args.ids_file)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(f"Loaded {len(id_prefixes)} request IDs from {args.ids_file}")
+
     if not args.input.exists():
         print(f"Input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
@@ -308,18 +343,29 @@ def main() -> None:
     print(f"Loaded {len(dataset)} labeled records from {args.input}")
 
     if args.mark_reviewed:
-        updated = 0
-        for record in dataset.records():
-            if not record.get("manually_reviewed"):
-                updated += 1
-        if updated:
-            with dataset._lock:
-                for record in dataset._records.values():
-                    record["manually_reviewed"] = True
-                dataset._flush()
-            print(f"Marked {updated} records as manually_reviewed")
-        else:
-            print("All records already marked as manually_reviewed")
+        if not id_prefixes:
+            print(
+                "--mark-reviewed requires explicit exact IDs via --ids or --ids-file",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        requested_ids = set(id_prefixes)
+        try:
+            updated = dataset.mark_reviewed_exact(requested_ids)
+        except ValueError as exc:
+            missing_ids = str(exc).splitlines()
+            print(
+                f"Refusing partial approval: {len(missing_ids)} exact request IDs "
+                "were not found",
+                file=sys.stderr,
+            )
+            for request_id in missing_ids:
+                print(f"  {request_id}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"Marked {updated} of {len(requested_ids)} explicitly selected "
+            "records as manually_reviewed"
+        )
         return
 
     if args.inspect is not None:
@@ -337,9 +383,9 @@ def main() -> None:
     # Select records to validate
     all_records = dataset.records()
 
-    if args.ids:
+    if id_prefixes:
         to_validate = [r for r in all_records
-                       if any(r["request_id"].startswith(prefix) for prefix in args.ids)]
+                       if any(r["request_id"].startswith(prefix) for prefix in id_prefixes)]
         print(f"Filtered to {len(to_validate)} records matching --ids")
     elif args.force:
         to_validate = all_records
@@ -432,7 +478,7 @@ def main() -> None:
 
     if fail_count:
         print(f"\nRun --show-failures to review failed records.")
-        print(f"Failed records will be excluded from training by prepare_dataset.py.")
+        print("Do not mark failed records as manually reviewed until corrected.")
 
 
 if __name__ == "__main__":

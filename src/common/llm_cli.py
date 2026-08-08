@@ -234,6 +234,34 @@ EVAL_JUDGE_SCHEMA = {
     "additionalProperties": False,
 }
 
+CODEX_EVAL_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "output_a": SCORES_SCHEMA,
+        "output_b": SCORES_SCHEMA,
+        "context_analysis": {
+            "type": "object",
+            "properties": {
+                "output_a": {"type": "string", "minLength": 1},
+                "output_b": {"type": "string", "minLength": 1},
+            },
+            "required": ["output_a", "output_b"],
+            "additionalProperties": False,
+        },
+        "score_analysis": {
+            "type": "object",
+            "properties": {
+                "output_a": {"type": "string", "minLength": 1},
+                "output_b": {"type": "string", "minLength": 1},
+            },
+            "required": ["output_a", "output_b"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["output_a", "output_b", "context_analysis", "score_analysis"],
+    "additionalProperties": False,
+}
+
 SYNTHETIC_SCHEMA = {
     "type": "object",
     "properties": {

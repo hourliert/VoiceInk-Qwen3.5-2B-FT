@@ -17,23 +17,31 @@ Correction policy:
   distant term merely because it fits the technical domain.
 - If multiple corrections remain genuinely plausible, preserve the transcript
   wording instead of guessing.
+- Do not leave an unintelligible or grammatically broken STT fragment in an
+  otherwise clean label. Resolve it only when transcript, vocabulary, or supplied
+  context gives strong evidence. If an isolated non-substantive fragment cannot
+  be resolved safely, omit only that fragment; never invent a replacement.
 - Preserve exact names, numbers, versions, identifiers, paths, URLs, and code
   symbols unless a correction is strongly supported.
 
-Measured correction examples:
-- "revise the pram" with "prompt" in vocabulary -> "Revise the prompt."
-- "I'm not a liar at the moment; I don't understand" -> "I'm not clear at the moment; I don't understand."
-- "it might be worse for you to dispatch an agent" -> "It might be worth dispatching an agent."
-- "revisit the TEETH Online" -> "Revisit the Test Online."
-- "cloud code", "voice ink", "previous slab", "break point" -> "Claude Code",
-  "VoiceInk", "previous lap", "brake point" when context supports those readings.
+- Do not rely on memorized examples or domain guesses. The evidence for every
+  correction must be present in this request's transcript, vocabulary, or
+  supplied context.
 
 Cleanup requirements:
-- Remove empty discourse openers ("Okay, so", "Yeah, so"), other fillers,
-  accidental stutters, false starts, and resolved self-corrections.
+- Remove empty discourse openers ("Okay, so", "Yeah, so", sentence-opening
+  "So"), other fillers, accidental stutters, false starts, and resolved
+  self-corrections. This is required cleanup, not optional stylistic editing.
+- Keep "okay", "yeah", or "so" only when it carries a meaningful reaction,
+  answer, contrast, or logical consequence. At the beginning of a request or
+  statement, delete it when the remaining sentence has the same meaning.
+- Collapse near-duplicate restatements of the same instruction when they are
+  speech repair or repetition around an explanation. Preserve deliberate
+  emphasis and genuinely distinct scope.
 - Preserve meaningful reactions, emphasis ("No, no"), opinions, uncertainty
   ("I think", "probably", "maybe"), commands, scope, and every substantive
-  detail. Do not turn suggestions into commands or rewrite technical claims.
+  detail, including concessions and changes of mind. Do not turn suggestions
+  into commands or rewrite technical claims.
 - Fix grammar, punctuation, contractions, French-English transfer patterns,
   word splitting, and obvious STT errors. Keep the speaker's informal or
   professional tone.
@@ -41,17 +49,20 @@ Cleanup requirements:
   utterances nearly unchanged.
 - For long QA debriefs, preserve sequence, detail, and intentional repeated
   coaching statements; improve paragraphs without shortening or summarizing.
+  Before returning a long label, scan every sentence for unresolved garble,
+  incomplete syntax, and technical terms that conflict with clearer repeated
+  usage elsewhere in the same transcript.
 - If the source is a fragment, capitalize and punctuate it without inventing
   missing context.
-
-Measured cleanup example:
-- "Yeah, cool. All makes sense. I think we can move on. So what's next?" ->
-  "Cool, all makes sense. What's next?"
 
 Before returning, silently verify:
 1. No output clause came from context rather than TRANSCRIPT.
 2. No obvious vocabulary-backed or locally coherent phonetic correction remains.
 3. Meaning, emphasis, uncertainty, commands, and scope are preserved.
+4. If the output starts with "Okay", "Yeah", or "So", that word contributes
+   meaning; otherwise remove it.
+5. No sentence is unintelligible, incomplete, or contradicted by stronger
+   evidence elsewhere in the TRANSCRIPT.
 
 CUSTOM VOCABULARY:
 {custom_vocabulary}

@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
                    help="Pick the N longest transcripts (by response length)")
     p.add_argument("--ids", nargs="*", default=None,
                    help="Label only these specific request IDs (prefix match)")
+    p.add_argument("--ids-file", type=Path, default=None,
+                   help="Read request IDs from a text file or JSONL manifest")
+    p.add_argument("--exclude-ids-file", type=Path, default=None,
+                   help="Exclude request IDs listed in a text file or JSONL manifest")
     p.add_argument("--force", action="store_true",
                    help="Re-label even if already labeled (use with --ids)")
     p.add_argument("--shuffle", action="store_true",
@@ -176,6 +180,30 @@ def load_reference_labels(path: Path) -> dict[str, dict]:
     return references
 
 
+def load_id_prefixes(path: Path) -> list[str]:
+    """Load request ID prefixes from newline text or a JSONL manifest."""
+    prefixes = []
+    seen = set()
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("{"):
+                try:
+                    prefix = str(json.loads(line)["request_id"]).strip()
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    raise ValueError(
+                        f"Invalid ID manifest entry at {path}:{line_number}"
+                    ) from exc
+            else:
+                prefix = line
+            if prefix and prefix not in seen:
+                prefixes.append(prefix)
+                seen.add(prefix)
+    return prefixes
+
+
 def label_one(record: dict, provider: str, model: str, reasoning_effort: str,
               dry_run: bool, judge_template: str,
               reference: dict | None = None) -> dict | None:
@@ -235,12 +263,51 @@ def main() -> None:
     args = parse_args()
     model = resolve_model(args.provider, args.model)
 
+    if args.ids is not None and args.ids_file is not None:
+        print("Use only one of --ids or --ids-file", file=sys.stderr)
+        sys.exit(1)
+    id_prefixes = args.ids
+    if args.ids_file is not None:
+        if not args.ids_file.is_file():
+            print(f"ID file not found: {args.ids_file}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            id_prefixes = load_id_prefixes(args.ids_file)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(f"Loaded {len(id_prefixes)} request IDs from {args.ids_file}")
+    excluded_prefixes = []
+    if args.exclude_ids_file is not None:
+        if not args.exclude_ids_file.is_file():
+            print(f"Exclusion ID file not found: {args.exclude_ids_file}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            excluded_prefixes = load_id_prefixes(args.exclude_ids_file)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"Loaded {len(excluded_prefixes)} excluded request IDs "
+            f"from {args.exclude_ids_file}"
+        )
+
     if not args.input.exists():
         print(f"Input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
     logs = load_logs(args.input)
     print(f"Loaded {len(logs)} valid log entries from {args.input}")
+    if excluded_prefixes:
+        before = len(logs)
+        logs = [
+            record for record in logs
+            if not any(
+                record["request_id"].startswith(prefix)
+                for prefix in excluded_prefixes
+            )
+        ]
+        print(f"Excluded {before - len(logs)} entries from the calibration pool")
 
     dataset = LabeledDataset(args.output)
     labeled_ids = dataset.labeled_ids()
@@ -257,10 +324,10 @@ def main() -> None:
         print(f"Restricted calibration pool to {len(logs)} reference-labeled entries")
 
     # Filter by specific IDs (prefix match) -- skip dedup when --force is set
-    if args.ids:
+    if id_prefixes:
         pool = logs if args.force else [r for r in logs if r["request_id"] not in labeled_ids]
         to_label = [r for r in pool
-                    if any(r["request_id"].startswith(prefix) for prefix in args.ids)]
+                    if any(r["request_id"].startswith(prefix) for prefix in id_prefixes)]
         print(f"Filtered to {len(to_label)} entries matching --ids{' (force)' if args.force else ''}")
     else:
         to_label = [r for r in logs if r["request_id"] not in labeled_ids]

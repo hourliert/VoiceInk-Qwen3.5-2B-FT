@@ -156,13 +156,15 @@ def main() -> None:
     if args.extra_input:
         print(f"Total records after merge: {len(records)}")
 
-    # Only include manually reviewed records (synthetic data is always included)
+    # Include human-reviewed or conservatively auto-approved real records.
     before = len(records)
     records = [r for r in records
-               if r.get("manually_reviewed") or r.get("request_id", "").startswith("syn-")]
+               if (r.get("manually_reviewed")
+                   or (r.get("auto_review") or {}).get("status") == "approved"
+                   or r.get("request_id", "").startswith("syn-"))]
     excluded = before - len(records)
     if excluded:
-        print(f"Excluded {excluded} records not manually reviewed")
+        print(f"Excluded {excluded} records pending or rejected by review")
 
     # Load system prompt
     if not args.system_prompt.exists():

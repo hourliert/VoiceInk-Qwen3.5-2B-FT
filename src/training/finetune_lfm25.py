@@ -10,6 +10,7 @@ import hashlib
 import json
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,13 +26,57 @@ LORA_TARGET_MODULES = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(frozen=True)
+class TrainingProfile:
+    name: str
+    description: str
+    base_model: str
+    lora_dir: Path
+    output_dir: Path
+    gguf_base: Path
+    r: int
+    lora_alpha: int
+    epochs: int
+    learning_rate: float
+
+
+LFM25_12B_PROFILE = TrainingProfile(
+    name="LFM2.5 1.2B Instruct",
+    description="Fine-tune LFM2.5 1.2B for VoiceInk with Unsloth.",
+    base_model=DEFAULT_MODEL,
+    lora_dir=DEFAULT_LORA_DIR,
+    output_dir=DEFAULT_OUTPUT_DIR,
+    gguf_base=DEFAULT_GGUF_BASE,
+    r=16,
+    lora_alpha=16,
+    epochs=1,
+    learning_rate=2e-4,
+)
+
+LFM25_26B_BASE_PROFILE = TrainingProfile(
+    name="LFM2.5 2.6B Base",
+    description="Fine-tune LFM2.5 2.6B Base for VoiceInk with Unsloth.",
+    base_model="LiquidAI/LFM2.5-2.6B-Base",
+    lora_dir=ROOT / "training" / "lfm25-2.6b-base" / "lora",
+    output_dir=ROOT / "training" / "lfm25-2.6b-base" / "outputs",
+    gguf_base=ROOT / "models" / "LFM2.5-2.6B-VoiceInk",
+    r=32,
+    lora_alpha=32,
+    epochs=2,
+    learning_rate=1e-4,
+)
+
+
+def parse_args(
+    profile: TrainingProfile = LFM25_12B_PROFILE,
+    argv: list[str] | None = None,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fine-tune LFM2.5 1.2B for VoiceInk with Unsloth."
+        description=profile.description
     )
     parser.add_argument("--train", type=Path, default=DEFAULT_TRAIN)
     parser.add_argument("--eval", type=Path, default=DEFAULT_EVAL)
-    parser.add_argument("--base-model", default=DEFAULT_MODEL)
+    parser.add_argument("--base-model", default=profile.base_model)
     parser.add_argument("--max-seq-length", type=int, default=16384)
 
     precision = parser.add_mutually_exclusive_group()
@@ -39,18 +84,18 @@ def parse_args() -> argparse.Namespace:
     precision.add_argument("--load-in-8bit", action="store_true")
     parser.add_argument("--offload-optimizer", action="store_true")
 
-    parser.add_argument("--r", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora-alpha", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--r", type=int, default=profile.r, help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=int, default=profile.lora_alpha)
+    parser.add_argument("--epochs", type=int, default=profile.epochs)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=profile.learning_rate)
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=-1)
 
-    parser.add_argument("--lora-dir", type=Path, default=DEFAULT_LORA_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--gguf-base", type=Path, default=DEFAULT_GGUF_BASE)
+    parser.add_argument("--lora-dir", type=Path, default=profile.lora_dir)
+    parser.add_argument("--output-dir", type=Path, default=profile.output_dir)
+    parser.add_argument("--gguf-base", type=Path, default=profile.gguf_base)
     parser.add_argument(
         "--export-gguf", nargs="*", default=None,
         help="Export after training; methods such as q4_k_m q8_0",
@@ -59,7 +104,8 @@ def parse_args() -> argparse.Namespace:
         "--check-only", action="store_true",
         help="Validate datasets and print configuration without loading or training a model",
     )
-    return parser.parse_args()
+    parser.set_defaults(profile_name=profile.name)
+    return parser.parse_args(argv)
 
 
 def file_sha256(path: Path) -> str:
@@ -105,6 +151,7 @@ def load_conversations(path: Path) -> list[dict]:
 def print_preflight(args: argparse.Namespace, train_data: list[dict],
                     eval_data: list[dict] | None) -> None:
     print("LFM2.5 training preflight")
+    print(f"  Profile: {args.profile_name}")
     print(f"  Base model: {args.base_model}")
     print(f"  Train: {args.train} ({len(train_data)} samples, sha256={file_sha256(args.train)})")
     if eval_data is not None:
@@ -155,8 +202,8 @@ def backup_existing_ggufs(directory: Path) -> None:
         shutil.copy2(gguf_file, backup)
 
 
-def main() -> None:
-    args = parse_args()
+def main(profile: TrainingProfile = LFM25_12B_PROFILE) -> None:
+    args = parse_args(profile)
     if not args.train.is_file():
         print(f"Training data not found: {args.train}", file=sys.stderr)
         sys.exit(1)

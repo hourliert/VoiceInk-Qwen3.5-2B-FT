@@ -11,6 +11,7 @@ Usage:
 """
 import argparse
 import datetime
+import hashlib
 import http.client
 import json
 import random
@@ -22,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from common.llm_cli import (
-    EVAL_JUDGE_SCHEMA,
+    CODEX_EVAL_JUDGE_SCHEMA,
     SCORE_DIMENSIONS,
     add_provider_args,
     call_llm,
@@ -62,6 +63,11 @@ def parse_args() -> argparse.Namespace:
                    help="Parallel judge calls")
     p.add_argument("--limit", type=int, default=0,
                    help="Max samples to evaluate (0 = all)")
+    p.add_argument(
+        "--sample-indices",
+        default=None,
+        help="Comma-separated zero-based eval indices; cannot be combined with --limit",
+    )
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for A/B assignment")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -110,7 +116,7 @@ def load_eval_data(path: Path) -> list[dict]:
     """Load eval.jsonl and extract messages + gold label."""
     samples = []
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for sample_index, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
@@ -128,12 +134,21 @@ def load_eval_data(path: Path) -> list[dict]:
             vocabulary = extract_last_tag_content(user_text, "CUSTOM_VOCABULARY")
             custom_vocabulary = vocabulary if vocabulary is not None else ""
 
+            window = extract_last_tag_content(user_text, "CURRENT_WINDOW_CONTEXT")
+            window_context = window if window is not None else ""
+
+            clipboard = extract_last_tag_content(user_text, "CLIPBOARD_CONTEXT")
+            clipboard_context = clipboard if clipboard is not None else ""
+
             samples.append({
+                "sample_index": sample_index,
                 "system_text": system_text,
                 "user_text": user_text,
                 "gold_label": gold_label,
                 "raw_transcript": raw_transcript,
                 "custom_vocabulary": custom_vocabulary,
+                "window_context": window_context,
+                "clipboard_context": clipboard_context,
                 "messages_for_llama": [
                     {"role": "system", "content": system_text},
                     {"role": "user", "content": user_text},
@@ -155,6 +170,24 @@ def load_cached_results(path: Path) -> dict[str, dict]:
             if key and "baseline_scores" in record and "candidate_scores" in record:
                 cache[key] = record
     return cache
+
+
+def select_sample_indices(samples: list[dict], specification: str) -> list[dict]:
+    """Select unique zero-based samples in the caller-provided order."""
+    try:
+        indices = [int(value.strip()) for value in specification.split(",")]
+    except ValueError as exc:
+        raise ValueError("--sample-indices must contain only integers") from exc
+    if not indices or any(not value.strip() for value in specification.split(",")):
+        raise ValueError("--sample-indices cannot contain empty values")
+    if len(indices) != len(set(indices)):
+        raise ValueError("--sample-indices cannot contain duplicates")
+    invalid = [index for index in indices if not 0 <= index < len(samples)]
+    if invalid:
+        raise ValueError(
+            f"--sample-indices out of range for {len(samples)} samples: {invalid}"
+        )
+    return [samples[index] for index in indices]
 
 
 def load_saved_outputs(path: Path) -> dict[str | int, dict]:
@@ -226,13 +259,16 @@ def generate_outputs(samples: list[dict], model: str, host: str, port: int) -> l
     return results
 
 
-def parse_judge_response(raw: str) -> dict | None:
+def parse_judge_response(raw: str, *, require_context_analysis: bool = False) -> dict | None:
     """Extract and strictly validate a judge response."""
     try:
         parsed = parse_json_response(raw)
     except (json.JSONDecodeError, ValueError):
         return None
-    if set(parsed) != {"output_a", "output_b"}:
+    required_keys = {"output_a", "output_b"}
+    if require_context_analysis:
+        required_keys.update(("context_analysis", "score_analysis"))
+    if set(parsed) != required_keys:
         return None
     for output in (parsed["output_a"], parsed["output_b"]):
         if not isinstance(output, dict) or set(output) != set(SCORE_DIMENSIONS):
@@ -240,6 +276,15 @@ def parse_judge_response(raw: str) -> dict | None:
         if any(type(output[dimension]) is not int or not 1 <= output[dimension] <= 5
                for dimension in SCORE_DIMENSIONS):
             return None
+    if require_context_analysis:
+        for analysis_name in ("context_analysis", "score_analysis"):
+            analysis = parsed[analysis_name]
+            if (not isinstance(analysis, dict)
+                    or set(analysis) != {"output_a", "output_b"}):
+                return None
+            if any(not isinstance(analysis[key], str) or not analysis[key].strip()
+                   for key in ("output_a", "output_b")):
+                return None
     return parsed
 
 
@@ -272,6 +317,8 @@ def judge_one(
         output_a=output_a,
         output_b=output_b,
         custom_vocabulary=sample.get("custom_vocabulary", "(none)"),
+        window_context=sample.get("window_context", "(none)"),
+        clipboard_context=sample.get("clipboard_context", "(none)"),
     )
 
     if dry_run:
@@ -287,14 +334,16 @@ def judge_one(
                 provider=judge_provider,
                 model=judge_model,
                 reasoning_effort=reasoning_effort,
-                output_schema=EVAL_JUDGE_SCHEMA if judge_provider == "codex" else None,
+                output_schema=CODEX_EVAL_JUDGE_SCHEMA if judge_provider == "codex" else None,
                 timeout=600,
             )
         except Exception as exc:
             print(f"  JUDGE ERROR: {exc}", file=sys.stderr)
             return None
 
-        parsed = parse_judge_response(raw)
+        parsed = parse_judge_response(
+            raw, require_context_analysis=judge_provider == "codex"
+        )
         if parsed and "output_a" in parsed and "output_b" in parsed:
             break
         label = "PARSE ERROR" if attempt == 0 else "PARSE ERROR (retry failed)"
@@ -312,13 +361,25 @@ def judge_one(
     if a_is == "baseline":
         baseline_scores = parsed["output_a"]
         candidate_scores = parsed["output_b"]
+        baseline_context_analysis = parsed.get("context_analysis", {}).get("output_a")
+        candidate_context_analysis = parsed.get("context_analysis", {}).get("output_b")
+        baseline_score_analysis = parsed.get("score_analysis", {}).get("output_a")
+        candidate_score_analysis = parsed.get("score_analysis", {}).get("output_b")
     else:
         baseline_scores = parsed["output_b"]
         candidate_scores = parsed["output_a"]
+        baseline_context_analysis = parsed.get("context_analysis", {}).get("output_b")
+        candidate_context_analysis = parsed.get("context_analysis", {}).get("output_a")
+        baseline_score_analysis = parsed.get("score_analysis", {}).get("output_b")
+        candidate_score_analysis = parsed.get("score_analysis", {}).get("output_a")
 
     return {
         "baseline_scores": baseline_scores,
         "candidate_scores": candidate_scores,
+        "baseline_context_analysis": baseline_context_analysis,
+        "candidate_context_analysis": candidate_context_analysis,
+        "baseline_score_analysis": baseline_score_analysis,
+        "candidate_score_analysis": candidate_score_analysis,
     }
 
 
@@ -595,7 +656,7 @@ def write_generation_outputs(path: Path, samples: list[dict],
             zip(samples, baseline_outputs, candidate_outputs)
         ):
             record = {
-                "sample_index": index,
+                "sample_index": sample.get("sample_index", index),
                 "raw_transcript": sample["raw_transcript"],
                 "gold_label": sample["gold_label"],
                 "baseline_model": baseline_model,
@@ -623,7 +684,7 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
             zip(samples, baseline_outputs, candidate_outputs, judgments)
         ):
             record = {
-                "sample_index": i,
+                "sample_index": sample.get("sample_index", i),
                 "raw_transcript": sample["raw_transcript"],
                 "gold_label": sample["gold_label"],
                 "baseline_output": b_out["text"],
@@ -632,6 +693,10 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
                 "candidate_duration_ms": c_out["duration_ms"],
                 "baseline_scores": judgment["baseline_scores"],
                 "candidate_scores": judgment["candidate_scores"],
+                "baseline_context_analysis": judgment.get("baseline_context_analysis"),
+                "candidate_context_analysis": judgment.get("candidate_context_analysis"),
+                "baseline_score_analysis": judgment.get("baseline_score_analysis"),
+                "candidate_score_analysis": judgment.get("candidate_score_analysis"),
                 "judge": judge_metadata,
                 "baseline_weighted": weighted_score(judgment["baseline_scores"]),
                 "candidate_weighted": weighted_score(judgment["candidate_scores"]),
@@ -652,6 +717,20 @@ def main() -> None:
     args = parse_args()
     judge_model = resolve_model(args.judge_provider, args.judge_model)
 
+    judge_template = ""
+    judge_metadata = provider_metadata(
+        args.judge_provider, judge_model, args.judge_reasoning_effort
+    )
+    if not args.generate_only:
+        prompt_path = provider_prompt_path(JUDGE_PROMPT_PATH, args.judge_provider)
+        if not prompt_path.is_file():
+            print(f"Judge prompt not found: {prompt_path}", file=sys.stderr)
+            sys.exit(1)
+        judge_template = prompt_path.read_text(encoding="utf-8")
+        judge_metadata["prompt_sha256"] = hashlib.sha256(
+            judge_template.encode("utf-8")
+        ).hexdigest()
+
     if not args.eval_data.exists():
         print(f"Eval data not found: {args.eval_data}", file=sys.stderr)
         sys.exit(1)
@@ -662,7 +741,16 @@ def main() -> None:
 
     # Load eval samples
     samples = load_eval_data(args.eval_data)
-    if args.limit > 0:
+    if args.sample_indices and args.limit > 0:
+        print("--sample-indices cannot be combined with --limit", file=sys.stderr)
+        sys.exit(2)
+    if args.sample_indices:
+        try:
+            samples = select_sample_indices(samples, args.sample_indices)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(2)
+    elif args.limit > 0:
         samples = samples[:args.limit]
     print(f"Loaded {len(samples)} eval samples")
 
@@ -672,6 +760,18 @@ def main() -> None:
         if args.resume.exists():
             cache = load_cached_results(args.resume)
             print(f"Loaded {len(cache)} cached results from {args.resume}")
+            expected_prompt_hash = judge_metadata.get("prompt_sha256")
+            compatible_cache = {
+                key: record for key, record in cache.items()
+                if record.get("judge", {}).get("prompt_sha256") == expected_prompt_hash
+            }
+            ignored = len(cache) - len(compatible_cache)
+            cache = compatible_cache
+            if ignored:
+                print(
+                    f"Ignored {ignored} cached results from a different or "
+                    "unversioned judge prompt"
+                )
         else:
             print(f"WARNING: resume file not found: {args.resume}")
 
@@ -701,6 +801,10 @@ def main() -> None:
         judge_results[i] = {
             "baseline_scores": c["baseline_scores"],
             "candidate_scores": c["candidate_scores"],
+            "baseline_context_analysis": c.get("baseline_context_analysis"),
+            "candidate_context_analysis": c.get("candidate_context_analysis"),
+            "baseline_score_analysis": c.get("baseline_score_analysis"),
+            "candidate_score_analysis": c.get("candidate_score_analysis"),
         }
 
     if args.outputs:
@@ -765,11 +869,6 @@ def main() -> None:
 
     errors = 0
     if uncached_indices:
-        prompt_path = provider_prompt_path(JUDGE_PROMPT_PATH, args.judge_provider)
-        if not prompt_path.is_file():
-            print(f"Judge prompt not found: {prompt_path}", file=sys.stderr)
-            sys.exit(1)
-        judge_template = prompt_path.read_text(encoding="utf-8")
         print(
             f"\nJudging {len(uncached_indices)} new outputs "
             f"({args.judge_provider}/{judge_model}, "
@@ -783,7 +882,7 @@ def main() -> None:
                     samples[i], baseline_outputs[i]["text"],
                     candidate_outputs[i]["text"], args.judge_provider,
                     judge_model, args.judge_reasoning_effort, args.dry_run,
-                    args.seed, i, judge_template,
+                    args.seed, samples[i]["sample_index"], judge_template,
                 )
                 judge_results[i] = result
                 if not result:
@@ -796,7 +895,7 @@ def main() -> None:
                         judge_one, samples[i], baseline_outputs[i]["text"],
                         candidate_outputs[i]["text"], args.judge_provider,
                         judge_model, args.judge_reasoning_effort, False,
-                        args.seed, i, judge_template,
+                        args.seed, samples[i]["sample_index"], judge_template,
                     )
                     futures[fut] = i
 
@@ -838,9 +937,6 @@ def main() -> None:
     # Aggregate and print
     summary = aggregate(filtered_judgments, filtered_baseline, filtered_candidate,
                         args.baseline, args.candidate)
-    judge_metadata = provider_metadata(
-        args.judge_provider, judge_model, args.judge_reasoning_effort
-    )
     summary["judge"] = judge_metadata
     print_summary(summary)
 

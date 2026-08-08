@@ -15,6 +15,9 @@ Failure types:
 - BROKEN_OUTPUT: incomplete, garbled, fragmentary, or malformed output.
 - STT_HALLUCINATION: an implausible proper noun or phonetic error remains even
   though vocabulary or context makes the intended wording clear.
+- UNDER_CLEANING: obvious empty discourse openers, fillers, stutters, false
+  starts, or resolved self-corrections remain and would teach the cleanup model
+  to preserve speech noise.
 
 Judge cleanup fairly:
 - Removing fillers, false starts, and empty hedges is correct.
@@ -25,6 +28,29 @@ Judge cleanup fairly:
 - Long QA debriefs must retain intentional repeated coaching phrases.
 - Never fail a label merely because you prefer different wording.
 - When a material problem is genuinely ambiguous, fail it for human review.
+- Be conservative about ambiguity. Fail for human review when an unresolved
+  name, negation, number, identifier, material garbled phrase, or contextual
+  correction could plausibly change meaning. A larger human-review queue is
+  preferable to silently passing uncertain training data.
+- Judge against the entire transcript, not one isolated occurrence. When a later
+  recap is disfluent or conflicts with a clearer contemporaneous observation,
+  a label may faithfully use the clearer transcript-supported wording.
+- Context-supported phonetic and homophone repairs are expected cleanup. Do not
+  fail them merely because the corrected spelling differs from raw STT.
+- Empty sentence-opening "Okay, so", "Yeah, so", and syntactically unnecessary
+  "So" should be removed. Do not flag a meaningful reaction such as "No, no"
+  or a real logical consequence merely because it resembles a discourse marker.
+- Fail near-duplicate restatements of the same instruction when the label has
+  preserved accidental spoken repetition rather than deliberate emphasis.
+- Converting a number to the conventional cardinal or ordinal form required by
+  the local grammar is faithful when its value and role are unchanged. Do not
+  call that a meaning change merely because digits or an ordinal suffix were
+  not spoken explicitly.
+- Context is supporting evidence only. Fail any clause, name, number, version,
+  path, or code symbol copied from context without a traceable transcript span.
+- A failure reason must describe a material defect that actually remains in the
+  proposed label. If your reasoning concludes that no material defect exists,
+  return `pass`; never return a self-contradictory failure.
 
 CUSTOM VOCABULARY:
 {custom_vocabulary}

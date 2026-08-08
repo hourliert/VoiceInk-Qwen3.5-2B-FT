@@ -125,7 +125,45 @@ hallucination, over-deletion, repetition, or broken output. Claude uses
 written back into `labeled.jsonl` as a `validation` field. Already-validated
 records are skipped unless `--force` is set.
 
-`prepare_dataset.py` automatically excludes records where `validation.status == "fail"` (override with `--include-failed`).
+Validation is triage, not automatic training approval. Real records enter the
+training dataset after either conservative automatic approval or a human
+approval/edit. Run deterministic triage after validation to auto-approve only
+records that pass both the LLM validator and all local ambiguity checks:
+
+```bash
+python3 src/labeling/triage.py \
+  --input datasets/strategic/luna56-pilot-100.jsonl \
+  --input datasets/strategic/luna56-batch-900.jsonl \
+  --migrate-legacy-reviewed \
+  --apply
+```
+
+The remaining records are the human-review queue. Open the local review UI for
+that queue, all unreviewed records, or an exact manifest of request IDs:
+
+```bash
+# Validator failures only (default)
+python3 src/labeling/review_server.py --input datasets/labeled.jsonl
+
+# Failures, missing validations, and suspicious validator passes
+python3 src/labeling/review_server.py \
+  --input datasets/labeled.jsonl \
+  --input datasets/another-labeled-batch.jsonl \
+  --mode suspicious \
+  --host 0.0.0.0 --port 8003
+
+# Exact request IDs from a text or JSONL manifest
+python3 src/labeling/review_server.py \
+  --input datasets/labeled.jsonl --ids-file datasets/review.jsonl
+```
+
+Browse to `http://<machine-LAN-IP>:8003` when binding to `0.0.0.0`. The
+review server has no authentication, so expose it only on a trusted local
+network. Automatic approvals are stored as `auto_review`; only UI decisions
+are stored as `manual_review`. Approve and Save Edit make a record eligible
+for training; Reject keeps it excluded. The suspicious heuristics prefer false
+alarms over silently accepting ambiguous names, numbers, negations, garbled
+phrases, or unusually large rewrites.
 
 ### 3. Synthetic data generation
 
@@ -190,6 +228,53 @@ The script auto-snapshots `datasets/labeled.jsonl` before training and auto-back
 - `--load-in-8bit` — loads in 8-bit (moderate savings)
 - `--offload-optimizer` — moves optimizer states to CPU RAM (no quality impact, slower)
 
+#### Qwen3.5 2B VoiceInk v2
+
+The v2 recipe keeps the existing 3,065 training samples and locked 340-sample
+regression evaluation. It adds reviewed strategic labels after deduplication,
+reserves a deterministic 100-sample engineering holdout, and quarantines
+inputs that could exceed the 16,384-token training context.
+
+```bash
+# Rebuild the deterministic split and its hashes/distribution report.
+.venv/bin/python3 src/training/prepare_qwen_v2.py
+
+# Validate the recipe without loading a model or using the GPU.
+.venv/bin/python3 src/training/finetune.py \
+  --train datasets/qwen35-2b-voiceink-v2/train.jsonl \
+  --eval datasets/qwen35-2b-voiceink-v2/eval-regression-340.jsonl \
+  --epochs 2 \
+  --lora-dir training/qwen35-2b-voiceink-v2/lora \
+  --output-dir training/qwen35-2b-voiceink-v2/outputs \
+  --gguf-base models/Qwen3.5-2B-VoiceInk-v2 \
+  --export-gguf q4_k_m q8_0 \
+  --check-only
+
+# One optimizer step; no GGUF export.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune.py \
+  --train datasets/qwen35-2b-voiceink-v2/train.jsonl \
+  --eval datasets/qwen35-2b-voiceink-v2/eval-regression-340.jsonl \
+  --epochs 2 --max-steps 1 \
+  --lora-dir training/qwen35-2b-voiceink-v2/smoke-lora \
+  --output-dir training/qwen35-2b-voiceink-v2/smoke-outputs \
+  --gguf-base models/Qwen3.5-2B-VoiceInk-v2
+
+# Full two-epoch run and isolated Q4_K_M/Q8_0 exports.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune.py \
+  --train datasets/qwen35-2b-voiceink-v2/train.jsonl \
+  --eval datasets/qwen35-2b-voiceink-v2/eval-regression-340.jsonl \
+  --epochs 2 \
+  --lora-dir training/qwen35-2b-voiceink-v2/lora \
+  --output-dir training/qwen35-2b-voiceink-v2/outputs \
+  --gguf-base models/Qwen3.5-2B-VoiceInk-v2 \
+  --export-gguf q4_k_m q8_0
+```
+
+The llama-server alias should be `Qwen3.5-2B-VoiceInk-v2`; the export
+directory is `models/Qwen3.5-2B-VoiceInk-v2_gguf`.
+
 #### LFM2.5 1.2B experiment
 
 LFM2.5 uses the same reviewed VoiceInk labels and synthetic samples, but its
@@ -213,6 +298,33 @@ training context, LoRA rank/alpha 16, an effective batch size of 8, one epoch,
 and completions-only loss. Run a one-step smoke test before the full job; use
 `--load-in-4bit` if the BF16 smoke test exceeds available VRAM. The `--check-only` path exits before importing Unsloth or loading the model.
 
+#### LFM2.5 2.6B Base experiment
+
+The 2.6B Base recipe reuses the reviewed LFM string-format dataset but keeps
+its adapter, checkpoints, and model exports separate. It defaults to 4-bit
+compatible LoRA rank/alpha 32, two epochs, a `1e-4` learning rate, and the
+same 16K context and effective batch size of 8.
+
+```bash
+# Validate paths, dataset hashes, and the complete recipe without loading a model.
+.venv/bin/python3 src/training/finetune_lfm25_26b_base.py \
+  --check-only --load-in-4bit --export-gguf q4_k_m q8_0
+
+# Load the model and complete exactly one optimizer step; do not export.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_base.py \
+  --max-steps 1 \
+  --load-in-4bit \
+  --lora-dir training/lfm25-2.6b-base/smoke-lora \
+  --output-dir training/lfm25-2.6b-base/smoke-outputs
+
+# Full two-epoch run followed by Q4_K_M and Q8_0 GGUF exports.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_base.py \
+  --load-in-4bit \
+  --export-gguf q4_k_m q8_0
+```
+
 ### 6. Evaluation
 
 ```bash
@@ -223,6 +335,13 @@ Runs blind A/B evaluation using the configured judge provider. For each eval sam
 1. Both models generate a cleaned transcript
 2. Outputs are randomly assigned as "Response A" / "Response B"
 3. The judge scores each on 6 weighted dimensions
+
+The Codex/Luna rubric also receives the current-window and clipboard context
+used by the local models. It treats those sources as disambiguation evidence
+rather than extra dictated content and stores concise context and score
+analyses for each output in the result JSONL. The legacy Claude prompt and
+output format remain available unchanged. Use `--sample-indices` for a
+deterministic calibration slice without regenerating model outputs.
 
 **Scoring rubric** (from `src/eval/judge_prompt.txt`):
 
