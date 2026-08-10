@@ -13,6 +13,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from .finetune import align_final_eval_schedule, compute_fused_eval_loss
+except ImportError:
+    from finetune import align_final_eval_schedule, compute_fused_eval_loss
+
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TRAIN = ROOT / "datasets" / "lfm25" / "train.jsonl"
 DEFAULT_EVAL = ROOT / "datasets" / "lfm25" / "eval.jsonl"
@@ -89,9 +94,14 @@ def parse_args(
     parser.add_argument("--epochs", type=int, default=profile.epochs)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=profile.learning_rate)
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=-1)
+    parser.add_argument("--eval-steps", type=int, default=50)
+    parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument("--load-best-model-at-end", action="store_true")
+    parser.add_argument("--resume-from-checkpoint", type=Path)
 
     parser.add_argument("--lora-dir", type=Path, default=profile.lora_dir)
     parser.add_argument("--output-dir", type=Path, default=profile.output_dir)
@@ -149,7 +159,8 @@ def load_conversations(path: Path) -> list[dict]:
 
 
 def print_preflight(args: argparse.Namespace, train_data: list[dict],
-                    eval_data: list[dict] | None) -> None:
+                    eval_data: list[dict] | None,
+                    planned_steps: int) -> None:
     print("LFM2.5 training preflight")
     print(f"  Profile: {args.profile_name}")
     print(f"  Base model: {args.base_model}")
@@ -161,8 +172,23 @@ def print_preflight(args: argparse.Namespace, train_data: list[dict],
     print(f"  Max sequence length: {args.max_seq_length}")
     print(f"  LoRA: r={args.r}, alpha={args.lora_alpha}")
     print(f"  LoRA targets: {', '.join(LORA_TARGET_MODULES)}")
-    print(f"  Effective batch size: {args.batch_size * args.grad_accum}")
+    print(
+        f"  Effective batch size: {args.batch_size * args.grad_accum} "
+        f"({args.batch_size} x {args.grad_accum})"
+    )
+    print(f"  Evaluation batch size: {args.eval_batch_size}")
     print(f"  Epochs: {args.epochs}; max steps: {args.max_steps}")
+    print(f"  Planned optimizer steps: {planned_steps}")
+    print(
+        f"  Evaluation: loss-only every {args.eval_steps} steps; "
+        f"checkpoint every {args.save_steps} steps"
+    )
+    if eval_data is not None:
+        print(f"  Terminal evaluation: guaranteed at step {planned_steps}")
+    print(
+        "  Final adapter source: "
+        + ("best eval-loss checkpoint" if args.load_best_model_at_end else "last step")
+    )
     print(f"  Load precision: {'4-bit' if args.load_in_4bit else '8-bit' if args.load_in_8bit else 'BF16'}")
     print(f"  Adapter output: {args.lora_dir}")
     print(f"  Checkpoints: {args.output_dir}")
@@ -202,17 +228,40 @@ def backup_existing_ggufs(directory: Path) -> None:
         shutil.copy2(gguf_file, backup)
 
 
-def main(profile: TrainingProfile = LFM25_12B_PROFILE) -> None:
-    args = parse_args(profile)
+def main(
+    profile: TrainingProfile = LFM25_12B_PROFILE,
+    argv: list[str] | None = None,
+) -> None:
+    args = parse_args(profile, argv)
     if not args.train.is_file():
         print(f"Training data not found: {args.train}", file=sys.stderr)
         sys.exit(1)
+    if min(args.batch_size, args.grad_accum, args.eval_batch_size, args.epochs,
+           args.eval_steps, args.save_steps) <= 0:
+        print("Training, evaluation, and checkpoint intervals must be positive",
+              file=sys.stderr)
+        sys.exit(2)
 
     train_conversations = load_conversations(args.train)
     eval_conversations = None
     if args.eval and args.eval.is_file():
         eval_conversations = load_conversations(args.eval)
-    print_preflight(args, train_conversations, eval_conversations)
+
+    planned_steps = align_final_eval_schedule(
+        args, len(train_conversations), bool(eval_conversations)
+    )
+    if args.load_best_model_at_end and not eval_conversations:
+        print("--load-best-model-at-end requires a non-empty --eval dataset",
+              file=sys.stderr)
+        sys.exit(2)
+    if args.load_best_model_at_end and args.save_steps % args.eval_steps != 0:
+        print("--save-steps must be a multiple of --eval-steps",
+              file=sys.stderr)
+        sys.exit(2)
+
+    print_preflight(
+        args, train_conversations, eval_conversations, planned_steps
+    )
     if args.check_only:
         print("Preflight complete; no model was loaded and no training was run.")
         return
@@ -248,7 +297,19 @@ def main(profile: TrainingProfile = LFM25_12B_PROFILE) -> None:
     )
     bf16 = is_bfloat16_supported()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    trainer = SFTTrainer(
+    class LossOnlyEvalSFTTrainer(SFTTrainer):
+        """Evaluate fused loss without retaining full-vocabulary logits."""
+
+        def prediction_step(
+            self, model, inputs, prediction_loss_only, ignore_keys=None
+        ):
+            if not prediction_loss_only:
+                return super().prediction_step(
+                    model, inputs, prediction_loss_only, ignore_keys
+                )
+            return compute_fused_eval_loss(self, model, inputs, torch)
+
+    trainer = LossOnlyEvalSFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=train_data,
@@ -272,8 +333,17 @@ def main(profile: TrainingProfile = LFM25_12B_PROFILE) -> None:
             output_dir=str(args.output_dir),
             report_to="none",
             eval_strategy="steps" if eval_data else "no",
-            eval_steps=50,
-            per_device_eval_batch_size=1,
+            eval_steps=args.eval_steps,
+            prediction_loss_only=True,
+            per_device_eval_batch_size=args.eval_batch_size,
+            save_strategy="steps",
+            save_steps=args.save_steps,
+            save_total_limit=2,
+            load_best_model_at_end=args.load_best_model_at_end,
+            metric_for_best_model=(
+                "eval_loss" if args.load_best_model_at_end else None
+            ),
+            greater_is_better=False,
             fp16=not bf16,
             bf16=bf16,
             fp16_full_eval=not bf16,
@@ -291,11 +361,17 @@ def main(profile: TrainingProfile = LFM25_12B_PROFILE) -> None:
     print(f"\nGPU: {gpu.name} — {gpu.total_memory / 1024 ** 3:.1f} GB")
     print(f"Initial reserved VRAM: {initial_memory:.2f} GB")
     print("Starting training...\n")
-    stats = trainer.train()
+    resume_checkpoint = (
+        str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
+    )
+    stats = trainer.train(resume_from_checkpoint=resume_checkpoint)
     peak_memory = torch.cuda.max_memory_reserved() / 1024 ** 3
     runtime = stats.metrics.get("train_runtime", 0)
     print(f"\nTraining complete in {runtime / 60:.1f} minutes")
     print(f"Peak reserved VRAM: {peak_memory:.2f} GB")
+    if args.load_best_model_at_end:
+        print(f"Best eval loss: {trainer.state.best_metric}")
+        print(f"Best checkpoint: {trainer.state.best_model_checkpoint}")
 
     args.lora_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving LoRA adapter to {args.lora_dir}")

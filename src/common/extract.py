@@ -18,6 +18,16 @@ def _extract_tag(text: str, tag: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _extract_outer_tag(text: str, tag: str) -> str:
+    """Extract a tag that wraps the complete message, preserving nested literals."""
+    stripped = text.strip()
+    opening = f"<{tag}>"
+    closing = f"</{tag}>"
+    if stripped.startswith(opening) and stripped.endswith(closing):
+        return stripped[len(opening):-len(closing)].strip()
+    return _extract_tag(text, tag)
+
+
 def extract_components(raw_request_json: str) -> dict:
     """Parse a stringified OpenAI chat request into structured fields.
 
@@ -57,7 +67,7 @@ def extract_components(raw_request_json: str) -> dict:
     clipboard_context = _extract_tag(after_instructions, "CLIPBOARD_CONTEXT")
 
     # Transcript is in the user message
-    transcript = _extract_tag(user_content, "TRANSCRIPT")
+    transcript = _extract_outer_tag(user_content, "TRANSCRIPT")
 
     return {
         "transcript": transcript,

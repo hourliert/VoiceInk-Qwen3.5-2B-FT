@@ -262,6 +262,36 @@ CODEX_EVAL_JUDGE_SCHEMA = {
     "additionalProperties": False,
 }
 
+PAIRWISE_PREFERENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "preference": {
+            "type": "string",
+            "enum": ["output_a", "output_b", "tie"],
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+        },
+        "material_difference": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1},
+    },
+    "required": [
+        "preference", "confidence", "material_difference", "reason",
+    ],
+    "additionalProperties": False,
+}
+
+CODEX_EVAL_JUDGE_STRICT_V2_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **CODEX_EVAL_JUDGE_SCHEMA["properties"],
+        "pairwise": PAIRWISE_PREFERENCE_SCHEMA,
+    },
+    "required": [*CODEX_EVAL_JUDGE_SCHEMA["required"], "pairwise"],
+    "additionalProperties": False,
+}
+
 SYNTHETIC_SCHEMA = {
     "type": "object",
     "properties": {

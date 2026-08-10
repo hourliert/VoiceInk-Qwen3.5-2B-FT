@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Fine-tune Qwen 3.5 2B for VoiceInk transcription cleanup using Unsloth.
+"""Fine-tune Qwen 3.5 for VoiceInk transcription cleanup using Unsloth.
 
-Qwen 3.5 2B is a unified VLM, so we use FastVisionModel even for text-only
+Qwen 3.5 is a unified VLM, so we use FastVisionModel even for text-only
 tasks. Loads training data (from prepare_dataset.py), applies LoRA, trains
 with SFT, and saves the adapter + optionally exports to GGUF.
 
@@ -19,6 +19,7 @@ import argparse
 import filecmp
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -60,6 +61,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
     p.add_argument("--batch-size", type=int, default=1, help="Per-device batch size")
     p.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps")
+    p.add_argument(
+        "--eval-batch-size", type=int, default=1,
+        help="Per-device loss-only evaluation batch size",
+    )
     p.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     p.add_argument("--warmup-steps", type=int, default=10, help="Warmup steps")
     p.add_argument("--max-steps", type=int, default=-1,
@@ -68,6 +73,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Run loss-only evaluation every N training steps")
     p.add_argument("--save-steps", type=int, default=25,
                    help="Save a resumable checkpoint every N training steps")
+    p.add_argument(
+        "--load-best-model-at-end",
+        action="store_true",
+        help=(
+            "Reload the checkpoint with the lowest eval loss before saving/exporting; "
+            "requires eval data and save-steps to be a multiple of eval-steps"
+        ),
+    )
     p.add_argument(
         "--resume-from-checkpoint", type=Path,
         help="Resume model, optimizer, scheduler, and trainer state from a checkpoint",
@@ -140,6 +153,60 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def expected_training_steps(
+    sample_count: int,
+    batch_size: int,
+    grad_accum: int,
+    epochs: int,
+    max_steps: int,
+) -> int:
+    """Return the optimizer steps Unsloth/Trainer will schedule on one GPU."""
+    if max_steps > 0:
+        return max_steps
+    batches_per_epoch = math.ceil(sample_count / batch_size)
+    return math.ceil(batches_per_epoch / grad_accum) * epochs
+
+
+def align_step_interval(total_steps: int, requested: int) -> int:
+    """Choose the closest cadence that divides the terminal step exactly."""
+    divisors = set()
+    for candidate in range(1, math.isqrt(total_steps) + 1):
+        if total_steps % candidate == 0:
+            divisors.add(candidate)
+            divisors.add(total_steps // candidate)
+    return min(divisors, key=lambda value: (abs(value - requested), -value))
+
+
+def align_final_eval_schedule(
+    args: argparse.Namespace, sample_count: int, eval_enabled: bool
+) -> int:
+    """Align step-based eval/save scheduling so the final model is considered."""
+    total_steps = expected_training_steps(
+        sample_count,
+        args.batch_size,
+        args.grad_accum,
+        args.epochs,
+        args.max_steps,
+    )
+    if not eval_enabled:
+        return total_steps
+
+    aligned = align_step_interval(total_steps, args.eval_steps)
+    if aligned != args.eval_steps:
+        print(
+            f"Aligning evaluation cadence from {args.eval_steps} to {aligned} "
+            f"steps so terminal step {total_steps} is evaluated."
+        )
+        args.eval_steps = aligned
+    if args.load_best_model_at_end and args.save_steps % args.eval_steps != 0:
+        print(
+            f"Aligning checkpoint cadence from {args.save_steps} to "
+            f"{args.eval_steps} steps for best-model selection."
+        )
+        args.save_steps = args.eval_steps
+    return total_steps
+
+
 def validate_conversations(records: list[dict], path: Path) -> None:
     """Fail closed on malformed Qwen typed-content conversations."""
     expected_roles = ["system", "user", "assistant"]
@@ -164,7 +231,8 @@ def validate_conversations(records: list[dict], path: Path) -> None:
 
 
 def print_preflight(args: argparse.Namespace, train_data: list[dict],
-                    eval_data: list[dict] | None) -> None:
+                    eval_data: list[dict] | None,
+                    planned_steps: int) -> None:
     precision = "4-bit" if args.load_in_4bit else (
         "8-bit" if args.load_in_8bit else "BF16"
     )
@@ -188,11 +256,19 @@ def print_preflight(args: argparse.Namespace, train_data: list[dict],
         f"  Effective batch size: {args.batch_size * args.grad_accum} "
         f"({args.batch_size} x {args.grad_accum})"
     )
+    print(f"  Evaluation batch size: {args.eval_batch_size}")
     print(f"  Epochs: {args.epochs}; max steps: {args.max_steps}")
+    print(f"  Planned optimizer steps: {planned_steps}")
     print(f"  Learning rate: {args.lr}; warmup steps: {args.warmup_steps}")
     print(
         f"  Evaluation: loss-only every {args.eval_steps} steps; "
         f"checkpoint every {args.save_steps} steps"
+    )
+    if eval_data is not None:
+        print(f"  Terminal evaluation: guaranteed at step {planned_steps}")
+    print(
+        "  Final adapter source: "
+        + ("best eval-loss checkpoint" if args.load_best_model_at_end else "last step")
     )
     if args.resume_from_checkpoint:
         print(f"  Resume checkpoint: {args.resume_from_checkpoint}")
@@ -223,8 +299,8 @@ def compute_fused_eval_loss(trainer, model, inputs, torch_module):
             os.environ["UNSLOTH_RETURN_LOGITS"] = previous
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    args = parse_args(argv)
 
     if not args.train.exists():
         print(f"Training data not found: {args.train}", file=sys.stderr)
@@ -232,6 +308,15 @@ def main() -> None:
 
     if args.load_in_4bit and args.load_in_8bit:
         print("Use only one of --load-in-4bit or --load-in-8bit", file=sys.stderr)
+        sys.exit(2)
+
+    if min(args.batch_size, args.grad_accum, args.eval_batch_size, args.epochs,
+           args.eval_steps, args.save_steps) <= 0:
+        print(
+            "Batch size, gradient accumulation, epochs, eval steps, and save "
+            "steps must all be positive",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     print(f"Loading training data from {args.train}")
@@ -243,7 +328,25 @@ def main() -> None:
         eval_data = load_dataset_jsonl(args.eval)
         validate_conversations(eval_data, args.eval)
 
-    print_preflight(args, train_data, eval_data)
+    planned_steps = align_final_eval_schedule(
+        args, len(train_data), bool(eval_data)
+    )
+    if args.load_best_model_at_end:
+        if not eval_data:
+            print(
+                "--load-best-model-at-end requires a non-empty --eval dataset",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.save_steps % args.eval_steps != 0:
+            print(
+                "--load-best-model-at-end requires --save-steps to be a multiple "
+                "of --eval-steps",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    print_preflight(args, train_data, eval_data, planned_steps)
     if args.check_only:
         print("Preflight complete; no model was loaded and no training was run.")
         return
@@ -336,11 +439,16 @@ def main() -> None:
             eval_steps=args.eval_steps,
             prediction_loss_only=True,
             fp16_full_eval=not args.load_in_4bit,
-            per_device_eval_batch_size=1,
+            per_device_eval_batch_size=args.eval_batch_size,
             # Save before the first evaluation so interruptions are resumable.
             save_strategy="steps",
             save_steps=args.save_steps,
             save_total_limit=2,
+            load_best_model_at_end=args.load_best_model_at_end,
+            metric_for_best_model=(
+                "eval_loss" if args.load_best_model_at_end else None
+            ),
+            greater_is_better=False,
             # Required for vision finetuning:
             remove_unused_columns=False,
             dataset_text_field="",
@@ -367,6 +475,9 @@ def main() -> None:
           f"({trainer_stats.metrics['train_runtime']/60:.1f}min)")
     print(f"  Peak VRAM: {used_memory} GB / {max_memory} GB "
           f"({round(used_memory/max_memory*100, 1)}%)")
+    if args.load_best_model_at_end:
+        print(f"  Best eval loss: {trainer.state.best_metric}")
+        print(f"  Best checkpoint: {trainer.state.best_model_checkpoint}")
 
     # ---- Save LoRA adapter ----
     args.lora_dir.mkdir(parents=True, exist_ok=True)
@@ -385,7 +496,7 @@ def main() -> None:
         # Back up existing GGUF files before overwriting (v1, v2, v3, ...)
         if gguf_final.exists():
             for gguf_file in sorted(gguf_final.glob("*.gguf")):
-                if ".v" in gguf_file.stem or gguf_file.name.startswith("Qwen3.5-2B.BF16"):
+                if ".v" in gguf_file.stem or "-mmproj" in gguf_file.stem:
                     continue
                 # Find next version number
                 existing_versions = sorted(gguf_final.glob(f"{gguf_file.stem}.v*.gguf"))

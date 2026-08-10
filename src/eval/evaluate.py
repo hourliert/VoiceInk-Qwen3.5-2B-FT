@@ -17,6 +17,7 @@ import json
 import random
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from common.llm_cli import (
     CODEX_EVAL_JUDGE_SCHEMA,
+    CODEX_EVAL_JUDGE_STRICT_V2_SCHEMA,
     SCORE_DIMENSIONS,
     add_provider_args,
     call_llm,
@@ -32,9 +34,24 @@ from common.llm_cli import (
     provider_prompt_path,
     resolve_model,
 )
-DEFAULT_EVAL = ROOT / "datasets" / "eval.jsonl"
+from training.prepare_dataset import (
+    build_user_message,
+    build_voiceink_system_message,
+    build_voiceink_user_message,
+)
+CANONICAL_EVAL = (
+    ROOT / "datasets" / "qwen35-2b-voiceink-v3" / "eval-all-440.jsonl"
+)
+CANONICAL_EVAL_COUNT = 440
+CANONICAL_EVAL_SHA256 = (
+    "0f08d1eb8788c716f265f2ec90d6495f7901d2dfe91d605dba130ef04db980f5"
+)
+DEFAULT_EVAL = CANONICAL_EVAL
 DEFAULT_OUTPUT_DIR = ROOT / "results"
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "judge_prompt.txt"
+STRICT_V2_JUDGE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "judge_prompt_strict_v2.txt"
+)
 
 WEIGHTS = {
     "meaning_preservation": 3,
@@ -48,17 +65,58 @@ TOTAL_WEIGHT = sum(WEIGHTS.values())  # 13
 MAX_SCORE = 5
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate baseline vs candidate model.")
     p.add_argument("--baseline", required=True,
                    help="Baseline model alias on llama-server (e.g., Qwen3.5-4B)")
     p.add_argument("--candidate", required=True,
                    help="Candidate model alias on llama-server (e.g., Qwen3.5-2B-VoiceInk)")
     p.add_argument("--eval-data", type=Path, default=DEFAULT_EVAL,
-                   help=f"Eval dataset JSONL (default: {DEFAULT_EVAL})")
+                   help=f"Eval dataset JSONL (default: canonical 440 at {DEFAULT_EVAL})")
+    p.add_argument(
+        "--allow-noncanonical-eval",
+        action="store_true",
+        help="Explicitly allow a full evaluation corpus other than canonical V3 440",
+    )
     p.add_argument("--llama-host", default="127.0.0.1")
     p.add_argument("--llama-port", type=int, default=8002)
+    p.add_argument(
+        "--baseline-temperature",
+        type=float,
+        default=0.3,
+        help="Sampling temperature for baseline inference (default: 0.3)",
+    )
+    p.add_argument(
+        "--candidate-temperature",
+        type=float,
+        default=0.3,
+        help="Sampling temperature for candidate inference (default: 0.3)",
+    )
+    p.add_argument(
+        "--inference-seed",
+        type=int,
+        default=None,
+        help="Optional shared llama.cpp sampling seed for reproducible paired inference",
+    )
+    p.add_argument(
+        "--baseline-message-layout",
+        choices=("prepared", "voiceink"),
+        default="voiceink",
+        help="Message layout for baseline inference (default: voiceink production layout)",
+    )
+    p.add_argument(
+        "--candidate-message-layout",
+        choices=("prepared", "voiceink"),
+        default="voiceink",
+        help="Message layout for candidate inference (default: voiceink production layout)",
+    )
     add_provider_args(p, prefix="judge")
+    p.add_argument(
+        "--judge-rubric",
+        choices=("legacy", "strict-v2"),
+        default="legacy",
+        help="Judge prompt/schema version (default: legacy)",
+    )
     p.add_argument("--parallel", type=int, default=3,
                    help="Parallel judge calls")
     p.add_argument("--limit", type=int, default=0,
@@ -81,7 +139,7 @@ def parse_args() -> argparse.Namespace:
                    help="Generate and save model outputs, then exit before judging")
     p.add_argument("--dry-run", action="store_true",
                    help="Print judge prompts without calling the configured provider")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 # ---- Data loading ----
@@ -112,6 +170,20 @@ def extract_last_tag_content(text: str, tag: str) -> str | None:
     return text[open_index + len(opening):close_index].strip()
 
 
+def unwrap_voiceink_system(text: str) -> tuple[str, str]:
+    """Return canonical instructions and dynamic context from a system message."""
+    stripped = text.strip()
+    opening = "<SYSTEM_INSTRUCTIONS>"
+    closing = "</SYSTEM_INSTRUCTIONS>"
+    if not stripped.startswith(opening):
+        return stripped, ""
+    close_index = stripped.find(closing)
+    if close_index < len(opening):
+        raise ValueError("Unclosed SYSTEM_INSTRUCTIONS wrapper in eval data")
+    instructions = stripped[len(opening):close_index].strip()
+    return instructions, stripped[close_index + len(closing):]
+
+
 def load_eval_data(path: Path) -> list[dict]:
     """Load eval.jsonl and extract messages + gold label."""
     samples = []
@@ -123,21 +195,50 @@ def load_eval_data(path: Path) -> list[dict]:
             record = json.loads(line)
             msgs = record["messages"]
 
-            system_text = message_text(msgs[0]["content"])
+            stored_system_text = message_text(msgs[0]["content"])
             user_text = message_text(msgs[1]["content"])
             gold_label = message_text(msgs[2]["content"])
 
+            system_text, context_text = unwrap_voiceink_system(stored_system_text)
+            stripped_user = user_text.strip()
+            stored_message_layout = (
+                "voiceink"
+                if (
+                    stored_system_text.strip().startswith("<SYSTEM_INSTRUCTIONS>")
+                    and stripped_user.startswith("<TRANSCRIPT>")
+                    and stripped_user.endswith("</TRANSCRIPT>")
+                )
+                else "prepared"
+            )
+
             # Extract raw transcript and vocabulary from user message
-            transcript = extract_last_tag_content(user_text, "TRANSCRIPT")
+            if (
+                stripped_user.startswith("<TRANSCRIPT>")
+                and stripped_user.endswith("</TRANSCRIPT>")
+            ):
+                transcript = stripped_user[
+                    len("<TRANSCRIPT>"):-len("</TRANSCRIPT>")
+                ].strip()
+            else:
+                transcript = extract_last_tag_content(user_text, "TRANSCRIPT")
             raw_transcript = transcript if transcript is not None else user_text.strip()
 
-            vocabulary = extract_last_tag_content(user_text, "CUSTOM_VOCABULARY")
+            vocabulary = (
+                extract_last_tag_content(user_text, "CUSTOM_VOCABULARY")
+                or extract_last_tag_content(context_text, "CUSTOM_VOCABULARY")
+            )
             custom_vocabulary = vocabulary if vocabulary is not None else ""
 
-            window = extract_last_tag_content(user_text, "CURRENT_WINDOW_CONTEXT")
+            window = (
+                extract_last_tag_content(user_text, "CURRENT_WINDOW_CONTEXT")
+                or extract_last_tag_content(context_text, "CURRENT_WINDOW_CONTEXT")
+            )
             window_context = window if window is not None else ""
 
-            clipboard = extract_last_tag_content(user_text, "CLIPBOARD_CONTEXT")
+            clipboard = (
+                extract_last_tag_content(user_text, "CLIPBOARD_CONTEXT")
+                or extract_last_tag_content(context_text, "CLIPBOARD_CONTEXT")
+            )
             clipboard_context = clipboard if clipboard is not None else ""
 
             samples.append({
@@ -149,12 +250,43 @@ def load_eval_data(path: Path) -> list[dict]:
                 "custom_vocabulary": custom_vocabulary,
                 "window_context": window_context,
                 "clipboard_context": clipboard_context,
-                "messages_for_llama": [
-                    {"role": "system", "content": system_text},
-                    {"role": "user", "content": user_text},
-                ],
+                "stored_system_text": stored_system_text,
+                "stored_user_text": user_text,
+                "stored_message_layout": stored_message_layout,
             })
     return samples
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_eval_corpus(
+    path: Path, sample_count: int, allow_noncanonical: bool = False
+) -> None:
+    """Fail closed unless a full benchmark uses the locked V3 440 corpus."""
+    if allow_noncanonical:
+        return
+    if path.resolve() != CANONICAL_EVAL.resolve():
+        raise ValueError(
+            f"Full evaluations require canonical {CANONICAL_EVAL_COUNT}-sample "
+            f"corpus {CANONICAL_EVAL}; pass --allow-noncanonical-eval to override"
+        )
+    if sample_count != CANONICAL_EVAL_COUNT:
+        raise ValueError(
+            f"Canonical evaluation must contain {CANONICAL_EVAL_COUNT} samples; "
+            f"found {sample_count}"
+        )
+    actual_hash = sha256_file(path)
+    if actual_hash != CANONICAL_EVAL_SHA256:
+        raise ValueError(
+            "Canonical evaluation fingerprint mismatch: "
+            f"expected {CANONICAL_EVAL_SHA256}, found {actual_hash}"
+        )
 
 
 def load_cached_results(path: Path) -> dict[str, dict]:
@@ -220,14 +352,48 @@ def load_saved_outputs(path: Path) -> dict[str | int, dict]:
 
 # ---- Model inference ----
 
-def query_llama(messages: list[dict], model: str, host: str, port: int) -> tuple[str, float]:
+def messages_for_layout(sample: dict, layout: str) -> list[dict]:
+    """Build model messages using prepared-dataset or live VoiceInk placement."""
+    if layout == sample.get("stored_message_layout"):
+        return [
+            {"role": "system", "content": sample["stored_system_text"]},
+            {"role": "user", "content": sample["stored_user_text"]},
+        ]
+    components = {
+        "window_context": sample["window_context"],
+        "clipboard_context": sample["clipboard_context"],
+        "custom_vocabulary": sample["custom_vocabulary"],
+        "transcript": sample["raw_transcript"],
+    }
+    if layout == "prepared":
+        system_text = sample["system_text"]
+        user_text = build_user_message(components)
+    elif layout == "voiceink":
+        system_text = build_voiceink_system_message(
+            components, sample["system_text"]
+        )
+        user_text = build_voiceink_user_message(components)
+    else:
+        raise ValueError(f"Unsupported message layout: {layout}")
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def query_llama(messages: list[dict], model: str, host: str, port: int,
+                temperature: float = 0.3,
+                seed: int | None = None) -> tuple[str, float]:
     """Send a chat completion request. Returns (response_text, duration_ms)."""
-    payload = json.dumps({
+    request = {
         "model": model,
         "messages": messages,
         "stream": False,
-        "temperature": 0.3,
-    }).encode("utf-8")
+        "temperature": temperature,
+    }
+    if seed is not None:
+        request["seed"] = seed
+    payload = json.dumps(request).encode("utf-8")
 
     start = time.monotonic()
     conn = http.client.HTTPConnection(host, port, timeout=300)
@@ -244,13 +410,19 @@ def query_llama(messages: list[dict], model: str, host: str, port: int) -> tuple
     return text, duration_ms
 
 
-def generate_outputs(samples: list[dict], model: str, host: str, port: int) -> list[dict]:
+def generate_outputs(samples: list[dict], model: str, host: str, port: int,
+                     temperature: float = 0.3,
+                     seed: int | None = None,
+                     message_layout: str = "voiceink") -> list[dict]:
     """Run a model on all eval samples sequentially."""
     results = []
     for i, sample in enumerate(samples, 1):
         print(f"  [{i}/{len(samples)}] {model}...", end=" ", flush=True)
         try:
-            text, duration_ms = query_llama(sample["messages_for_llama"], model, host, port)
+            text, duration_ms = query_llama(
+                messages_for_layout(sample, message_layout), model, host, port,
+                temperature=temperature, seed=seed,
+            )
             print(f"{duration_ms:.0f}ms")
             results.append({"text": text, "duration_ms": duration_ms})
         except Exception as exc:
@@ -259,7 +431,8 @@ def generate_outputs(samples: list[dict], model: str, host: str, port: int) -> l
     return results
 
 
-def parse_judge_response(raw: str, *, require_context_analysis: bool = False) -> dict | None:
+def parse_judge_response(raw: str, *, require_context_analysis: bool = False,
+                         require_pairwise: bool = False) -> dict | None:
     """Extract and strictly validate a judge response."""
     try:
         parsed = parse_json_response(raw)
@@ -268,6 +441,8 @@ def parse_judge_response(raw: str, *, require_context_analysis: bool = False) ->
     required_keys = {"output_a", "output_b"}
     if require_context_analysis:
         required_keys.update(("context_analysis", "score_analysis"))
+    if require_pairwise:
+        required_keys.add("pairwise")
     if set(parsed) != required_keys:
         return None
     for output in (parsed["output_a"], parsed["output_b"]):
@@ -285,6 +460,20 @@ def parse_judge_response(raw: str, *, require_context_analysis: bool = False) ->
             if any(not isinstance(analysis[key], str) or not analysis[key].strip()
                    for key in ("output_a", "output_b")):
                 return None
+    if require_pairwise:
+        pairwise = parsed["pairwise"]
+        if not isinstance(pairwise, dict) or set(pairwise) != {
+            "preference", "confidence", "material_difference", "reason"
+        }:
+            return None
+        if pairwise["preference"] not in ("output_a", "output_b", "tie"):
+            return None
+        if pairwise["confidence"] not in ("low", "medium", "high"):
+            return None
+        if type(pairwise["material_difference"]) is not bool:
+            return None
+        if not isinstance(pairwise["reason"], str) or not pairwise["reason"].strip():
+            return None
     return parsed
 
 
@@ -299,6 +488,7 @@ def judge_one(
     assignment_seed: int,
     seed_offset: int,
     judge_template: str,
+    judge_rubric: str = "legacy",
 ) -> dict | None:
     """Judge a single sample. Returns structured result or None on failure."""
     rng = random.Random(assignment_seed + seed_offset)
@@ -329,12 +519,15 @@ def judge_one(
 
     for attempt in range(2):
         try:
+            output_schema = CODEX_EVAL_JUDGE_SCHEMA
+            if judge_rubric == "strict-v2":
+                output_schema = CODEX_EVAL_JUDGE_STRICT_V2_SCHEMA
             raw = call_llm(
                 prompt,
                 provider=judge_provider,
                 model=judge_model,
                 reasoning_effort=reasoning_effort,
-                output_schema=CODEX_EVAL_JUDGE_SCHEMA if judge_provider == "codex" else None,
+                output_schema=output_schema if judge_provider == "codex" else None,
                 timeout=600,
             )
         except Exception as exc:
@@ -342,7 +535,11 @@ def judge_one(
             return None
 
         parsed = parse_judge_response(
-            raw, require_context_analysis=judge_provider == "codex"
+            raw,
+            require_context_analysis=judge_provider == "codex",
+            require_pairwise=(
+                judge_provider == "codex" and judge_rubric == "strict-v2"
+            ),
         )
         if parsed and "output_a" in parsed and "output_b" in parsed:
             break
@@ -373,7 +570,7 @@ def judge_one(
         baseline_score_analysis = parsed.get("score_analysis", {}).get("output_b")
         candidate_score_analysis = parsed.get("score_analysis", {}).get("output_a")
 
-    return {
+    result = {
         "baseline_scores": baseline_scores,
         "candidate_scores": candidate_scores,
         "baseline_context_analysis": baseline_context_analysis,
@@ -381,6 +578,22 @@ def judge_one(
         "baseline_score_analysis": baseline_score_analysis,
         "candidate_score_analysis": candidate_score_analysis,
     }
+    pairwise = parsed.get("pairwise")
+    if pairwise:
+        preference = pairwise["preference"]
+        if preference == "tie":
+            mapped_preference = "tie"
+        elif (preference == "output_a") == (a_is == "baseline"):
+            mapped_preference = "baseline"
+        else:
+            mapped_preference = "candidate"
+        result.update({
+            "pairwise_preference": mapped_preference,
+            "pairwise_confidence": pairwise["confidence"],
+            "pairwise_material_difference": pairwise["material_difference"],
+            "pairwise_reason": pairwise["reason"],
+        })
+    return result
 
 
 # ---- Scoring ----
@@ -524,7 +737,7 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
         {d: sum(v) / len(v) for d, v in per_dim_candidate.items()},
     )
 
-    return {
+    summary = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "baseline_model": baseline_model,
         "candidate_model": candidate_model,
@@ -543,6 +756,36 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
         "winner": winner,
         "winner_reason": reason,
     }
+    pairwise_judgments = [
+        judgment for judgment in judgments
+        if judgment.get("pairwise_preference") in ("baseline", "candidate", "tie")
+    ]
+    if pairwise_judgments:
+        preferences = {
+            name: sum(
+                judgment["pairwise_preference"] == name
+                for judgment in pairwise_judgments
+            )
+            for name in ("baseline", "candidate", "tie")
+        }
+        material = {
+            name: sum(
+                judgment["pairwise_preference"] == name
+                and judgment.get("pairwise_material_difference") is True
+                for judgment in pairwise_judgments
+            )
+            for name in ("baseline", "candidate")
+        }
+        summary["judge_pairwise"] = {
+            "n": len(pairwise_judgments),
+            "preferences": preferences,
+            "material_wins": material,
+            "confidence": dict(Counter(
+                judgment.get("pairwise_confidence", "unknown")
+                for judgment in pairwise_judgments
+            )),
+        }
+    return summary
 
 
 def determine_winner(b_avg, c_avg, b_dims, c_dims):
@@ -619,6 +862,20 @@ def print_summary(summary: dict) -> None:
           f"  95% CI [{wr_ci[0]*100:.0f}%, {wr_ci[1]*100:.0f}%]"
           f"  (ties: {w['tie']})")
 
+    judge_pairwise = summary.get("judge_pairwise")
+    if judge_pairwise:
+        preferences = judge_pairwise["preferences"]
+        material = judge_pairwise["material_wins"]
+        print(
+            "  Strict pairwise: "
+            f"candidate {preferences['candidate']}, "
+            f"baseline {preferences['baseline']}, ties {preferences['tie']}"
+        )
+        print(
+            "  Material wins:  "
+            f"candidate {material['candidate']}, baseline {material['baseline']}"
+        )
+
     # ---- Latency ----
     b_lat = summary.get("baseline_latency", {})
     c_lat = summary.get("candidate_latency", {})
@@ -648,7 +905,12 @@ def print_summary(summary: dict) -> None:
 def write_generation_outputs(path: Path, samples: list[dict],
                              baseline_outputs: list[dict],
                              candidate_outputs: list[dict],
-                             baseline_model: str, candidate_model: str) -> None:
+                             baseline_model: str, candidate_model: str,
+                             baseline_temperature: float = 0.3,
+                             candidate_temperature: float = 0.3,
+                             inference_seed: int | None = None,
+                             baseline_message_layout: str = "voiceink",
+                             candidate_message_layout: str = "voiceink") -> None:
     """Persist model outputs before any external judging begins."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
@@ -661,6 +923,16 @@ def write_generation_outputs(path: Path, samples: list[dict],
                 "gold_label": sample["gold_label"],
                 "baseline_model": baseline_model,
                 "candidate_model": candidate_model,
+                "baseline_sampling": {
+                    "temperature": baseline_temperature,
+                    "seed": inference_seed,
+                    "message_layout": baseline_message_layout,
+                },
+                "candidate_sampling": {
+                    "temperature": candidate_temperature,
+                    "seed": inference_seed,
+                    "message_layout": candidate_message_layout,
+                },
                 "baseline_output": baseline["text"],
                 "candidate_output": candidate["text"],
                 "baseline_duration_ms": baseline.get("duration_ms", 0),
@@ -697,6 +969,12 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
                 "candidate_context_analysis": judgment.get("candidate_context_analysis"),
                 "baseline_score_analysis": judgment.get("baseline_score_analysis"),
                 "candidate_score_analysis": judgment.get("candidate_score_analysis"),
+                "pairwise_preference": judgment.get("pairwise_preference"),
+                "pairwise_confidence": judgment.get("pairwise_confidence"),
+                "pairwise_material_difference": judgment.get(
+                    "pairwise_material_difference"
+                ),
+                "pairwise_reason": judgment.get("pairwise_reason"),
                 "judge": judge_metadata,
                 "baseline_weighted": weighted_score(judgment["baseline_scores"]),
                 "candidate_weighted": weighted_score(judgment["candidate_scores"]),
@@ -715,14 +993,27 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
 
 def main() -> None:
     args = parse_args()
+    if args.judge_rubric == "strict-v2" and args.judge_provider != "codex":
+        print(
+            "--judge-rubric strict-v2 currently requires --judge-provider codex; "
+            "legacy Claude judging remains available",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     judge_model = resolve_model(args.judge_provider, args.judge_model)
 
     judge_template = ""
     judge_metadata = provider_metadata(
         args.judge_provider, judge_model, args.judge_reasoning_effort
     )
+    judge_metadata["rubric"] = args.judge_rubric
     if not args.generate_only:
-        prompt_path = provider_prompt_path(JUDGE_PROMPT_PATH, args.judge_provider)
+        prompt_base = (
+            STRICT_V2_JUDGE_PROMPT_PATH
+            if args.judge_rubric == "strict-v2"
+            else JUDGE_PROMPT_PATH
+        )
+        prompt_path = provider_prompt_path(prompt_base, args.judge_provider)
         if not prompt_path.is_file():
             print(f"Judge prompt not found: {prompt_path}", file=sys.stderr)
             sys.exit(1)
@@ -738,9 +1029,21 @@ def main() -> None:
     if args.generate_only and args.outputs:
         print("--generate-only cannot be combined with --outputs", file=sys.stderr)
         sys.exit(2)
+    if args.baseline_temperature < 0 or args.candidate_temperature < 0:
+        print("Inference temperatures must be non-negative", file=sys.stderr)
+        sys.exit(2)
 
-    # Load eval samples
+    # Load and validate the full corpus before applying an explicit debug slice.
     samples = load_eval_data(args.eval_data)
+    try:
+        validate_eval_corpus(
+            args.eval_data,
+            len(samples),
+            allow_noncanonical=args.allow_noncanonical_eval,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
     if args.sample_indices and args.limit > 0:
         print("--sample-indices cannot be combined with --limit", file=sys.stderr)
         sys.exit(2)
@@ -805,6 +1108,12 @@ def main() -> None:
             "candidate_context_analysis": c.get("candidate_context_analysis"),
             "baseline_score_analysis": c.get("baseline_score_analysis"),
             "candidate_score_analysis": c.get("candidate_score_analysis"),
+            "pairwise_preference": c.get("pairwise_preference"),
+            "pairwise_confidence": c.get("pairwise_confidence"),
+            "pairwise_material_difference": c.get(
+                "pairwise_material_difference"
+            ),
+            "pairwise_reason": c.get("pairwise_reason"),
         }
 
     if args.outputs:
@@ -834,22 +1143,34 @@ def main() -> None:
         uncached_samples = [samples[i] for i in uncached_indices]
         warmup_msgs = [{"role": "user", "content": "Hello"}]
 
-        for model_name, destination in (
-            (args.baseline, baseline_outputs),
-            (args.candidate, candidate_outputs),
+        for model_name, temperature, message_layout, destination in (
+            (args.baseline, args.baseline_temperature,
+             args.baseline_message_layout, baseline_outputs),
+            (args.candidate, args.candidate_temperature,
+             args.candidate_message_layout, candidate_outputs),
         ):
-            print(f"Warming up {model_name}...", end=" ", flush=True)
+            print(
+                f"Warming up {model_name} (temperature={temperature:g}, "
+                f"layout={message_layout})...",
+                end=" ", flush=True,
+            )
             try:
                 _, milliseconds = query_llama(
-                    warmup_msgs, model_name, args.llama_host, args.llama_port
+                    warmup_msgs, model_name, args.llama_host, args.llama_port,
+                    temperature=temperature, seed=args.inference_seed,
                 )
                 print(f"{milliseconds:.0f}ms (discarded)")
             except Exception as exc:
                 print(f"WARNING: warmup failed: {exc}")
 
-            print(f"\nGenerating outputs ({model_name})...")
+            print(
+                f"\nGenerating outputs ({model_name}, temperature={temperature:g}, "
+                f"layout={message_layout})..."
+            )
             generated = generate_outputs(
-                uncached_samples, model_name, args.llama_host, args.llama_port
+                uncached_samples, model_name, args.llama_host, args.llama_port,
+                temperature=temperature, seed=args.inference_seed,
+                message_layout=message_layout,
             )
             for position, sample_index in enumerate(uncached_indices):
                 destination[sample_index] = generated[position]
@@ -861,6 +1182,9 @@ def main() -> None:
         write_generation_outputs(
             generation_path, samples, baseline_outputs, candidate_outputs,
             args.baseline, args.candidate,
+            args.baseline_temperature, args.candidate_temperature,
+            args.inference_seed, args.baseline_message_layout,
+            args.candidate_message_layout,
         )
 
     if args.generate_only:
@@ -883,6 +1207,7 @@ def main() -> None:
                     candidate_outputs[i]["text"], args.judge_provider,
                     judge_model, args.judge_reasoning_effort, args.dry_run,
                     args.seed, samples[i]["sample_index"], judge_template,
+                    args.judge_rubric,
                 )
                 judge_results[i] = result
                 if not result:
@@ -896,6 +1221,7 @@ def main() -> None:
                         candidate_outputs[i]["text"], args.judge_provider,
                         judge_model, args.judge_reasoning_effort, False,
                         args.seed, samples[i]["sample_index"], judge_template,
+                        args.judge_rubric,
                     )
                     futures[fut] = i
 

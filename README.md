@@ -275,6 +275,41 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 The llama-server alias should be `Qwen3.5-2B-VoiceInk-v2`; the export
 directory is `models/Qwen3.5-2B-VoiceInk-v2_gguf`.
 
+#### Qwen3.5 0.8B VoiceInk experiment
+
+The dedicated 0.8B entry point reuses the exact locked V3 training samples
+(`3,962` rows) and regression evaluation (`340` rows) from the latest 2B V3
+run. It keeps the same one-epoch LoRA recipe (`r=32`, `alpha=64`, effective
+batch size 8, `2e-4` learning rate), but uses batch 4 with two accumulation
+steps and loss-only eval batches of 4 for better GPU utilization. Evaluation
+and checkpoint intervals are automatically aligned so the terminal optimizer
+step is always eligible for best-model selection. All new checkpoints and
+exports remain isolated under `qwen35-08b-voiceink-v1` paths.
+
+```bash
+# Validate paths, hashes, sample counts, and the resolved recipe without a GPU.
+.venv/bin/python3 src/training/finetune_qwen35_08b.py --check-only
+
+# Load the cached base model and complete exactly one optimizer step.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_qwen35_08b.py \
+  --max-steps 1 \
+  --save-steps 1 \
+  --lora-dir training/qwen35-08b-voiceink-v1/smoke-lora \
+  --output-dir training/qwen35-08b-voiceink-v1/smoke-outputs
+
+# Full V3-equivalent run; retain the lowest regression-eval-loss checkpoint,
+# then export both deployment and diagnostic quantizations.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_qwen35_08b.py \
+  --load-best-model-at-end \
+  --export-gguf q4_k_m q8_0
+```
+
+The base checkpoint is `unsloth/Qwen3.5-0.8B` in the normal Hugging Face
+cache. Final GGUFs are written to
+`models/Qwen3.5-0.8B-VoiceInk-v1_gguf`; the smoke run never exports a model.
+
 #### LFM2.5 1.2B experiment
 
 LFM2.5 uses the same reviewed VoiceInk labels and synthetic samples, but its
@@ -297,6 +332,22 @@ The dedicated trainer defaults to `LiquidAI/LFM2.5-1.2B-Instruct`, a 16K
 training context, LoRA rank/alpha 16, an effective batch size of 8, one epoch,
 and completions-only loss. Run a one-step smoke test before the full job; use
 `--load-in-4bit` if the BF16 smoke test exceeds available VRAM. The `--check-only` path exits before importing Unsloth or loading the model.
+
+For a controlled comparison with Qwen3.5 0.8B, convert the exact locked V3
+conversations and use the isolated V3 profile:
+
+```bash
+.venv/bin/python3 src/training/prepare_lfm25_v3.py
+.venv/bin/python3 src/training/finetune_lfm25_12b_v3.py --check-only
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_12b_v3.py \
+  --export-gguf q4_k_m q8_0
+```
+
+The V3 profile uses batch 4 with two accumulation steps, eval batch 4, aligned
+terminal evaluation, best-checkpoint selection, and isolated
+`lfm25-1.2b-voiceink-v3` paths.
 
 #### LFM2.5 2.6B Base experiment
 
@@ -330,6 +381,13 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 ```bash
 python3 src/eval/evaluate.py --baseline Qwen3.5-4B --candidate Qwen3.5-2B-VoiceInk
 ```
+
+Full evaluations are locked to
+`datasets/qwen35-2b-voiceink-v3/eval-all-440.jsonl`: 340 regression samples
+plus 100 engineering holdouts. The evaluator validates the path, row count,
+and SHA-256 fingerprint before generation or judging. A different corpus
+requires the explicit `--allow-noncanonical-eval` escape hatch; `--limit`
+and `--sample-indices` only select debug slices after the 440-source check.
 
 Runs blind A/B evaluation using the configured judge provider. For each eval sample:
 1. Both models generate a cleaned transcript
@@ -369,6 +427,39 @@ python3 src/eval/evaluate.py \
   --judge-provider codex --judge-model gpt-5.6-luna \
   --judge-reasoning-effort low --parallel 3
 ```
+
+#### Raw model speed screening
+
+Use the paired HTTP benchmark for a production-layout latency check before
+investing in a fine-tuning run. It samples the locked 440 corpus, warms both
+servers, alternates request order, and reports wall latency plus prompt and
+generation throughput. Start the candidate on an isolated port while the
+production Qwen model remains available on port 8002:
+
+```bash
+hf download LiquidAI/LFM2.5-8B-A1B-GGUF \
+  LFM2.5-8B-A1B-Q4_K_M.gguf LICENSE README.md \
+  --local-dir models/LFM2.5-8B-A1B-GGUF
+
+/home/thomas/llama.cpp/llama-server \
+  --host 127.0.0.1 --port 41788 --parallel 1 \
+  --flash-attn on --jinja --metrics \
+  --reasoning off --reasoning-budget 0 \
+  --alias LFM2.5-8B-A1B --ctx-size 16384 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --temperature 0.2 --top-k 80 --repeat-penalty 1.05 \
+  --model models/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf
+
+python3 src/eval/benchmark_inference_speed.py \
+  --baseline-model Qwen3.5-2B-VoiceInk-v3 --baseline-port 8002 \
+  --candidate-model LFM2.5-8B-A1B --candidate-port 41788 \
+  --samples 20 --warmups 2 --temperature 0 \
+  --output results/lfm25-8b-a1b-vs-qwen2b-v3-speed.json
+```
+
+The `LFM2.5-8B-A1B` preset in `config/models.ini` disables reasoning by
+construction. Without that setting, hidden chain-of-thought tokens dominate
+end-to-end latency and make a raw throughput comparison misleading.
 
 ## Results
 

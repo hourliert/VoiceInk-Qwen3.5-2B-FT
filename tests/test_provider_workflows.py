@@ -7,11 +7,17 @@ from pathlib import Path
 
 from src.common.llm_cli import SCORE_DIMENSIONS
 from src.eval.evaluate import (
+    CANONICAL_EVAL,
+    CANONICAL_EVAL_COUNT,
+    DEFAULT_EVAL,
+    aggregate,
     load_eval_data,
     load_saved_outputs,
     message_text,
+    messages_for_layout,
     parse_judge_response,
     select_sample_indices,
+    validate_eval_corpus,
 )
 from src.labeling.label import load_logs, load_reference_labels
 
@@ -24,6 +30,18 @@ class ProviderWorkflowTests(unittest.TestCase):
             for record in records:
                 temporary.write(json.dumps(record) + "\n")
         return Path(temporary.name)
+
+    def test_default_eval_is_locked_canonical_440(self) -> None:
+        self.assertEqual(DEFAULT_EVAL, CANONICAL_EVAL)
+        samples = load_eval_data(DEFAULT_EVAL)
+        self.assertEqual(len(samples), CANONICAL_EVAL_COUNT)
+        validate_eval_corpus(DEFAULT_EVAL, len(samples))
+
+    def test_noncanonical_full_eval_requires_explicit_override(self) -> None:
+        path = self.write_jsonl([])
+        with self.assertRaisesRegex(ValueError, "require canonical"):
+            validate_eval_corpus(path, 0)
+        validate_eval_corpus(path, 0, allow_noncanonical=True)
 
     def test_message_text_supports_qwen_and_lfm_content(self) -> None:
         self.assertEqual(message_text("plain"), "plain")
@@ -70,6 +88,48 @@ class ProviderWorkflowTests(unittest.TestCase):
         self.assertEqual(sample["clipboard_context"], "reportZonePlanResults")
         self.assertEqual(sample["custom_vocabulary"], "VoiceInk")
 
+    def test_eval_loader_accepts_voiceink_production_layout(self) -> None:
+        path = self.write_jsonl([{
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "<SYSTEM_INSTRUCTIONS>system</SYSTEM_INSTRUCTIONS>"
+                        "<CURRENT_WINDOW_CONTEXT>app.ts</CURRENT_WINDOW_CONTEXT>"
+                        "<CUSTOM_VOCABULARY>VoiceInk</CUSTOM_VOCABULARY>"
+                    ),
+                },
+                {"role": "user", "content": "<TRANSCRIPT>Voice Inc</TRANSCRIPT>"},
+                {"role": "assistant", "content": "VoiceInk"},
+            ]
+        }])
+
+        sample = load_eval_data(path)[0]
+
+        self.assertEqual(sample["system_text"], "system")
+        self.assertEqual(sample["window_context"], "app.ts")
+        self.assertEqual(sample["custom_vocabulary"], "VoiceInk")
+        production = messages_for_layout(sample, "voiceink")
+        prepared = messages_for_layout(sample, "prepared")
+        self.assertIn("CURRENT_WINDOW_CONTEXT", production[0]["content"])
+        self.assertNotIn("CURRENT_WINDOW_CONTEXT", production[1]["content"])
+        self.assertNotIn("SYSTEM_INSTRUCTIONS", prepared[0]["content"])
+        self.assertIn("CURRENT_WINDOW_CONTEXT", prepared[1]["content"])
+        self.assertEqual(
+            production,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "<SYSTEM_INSTRUCTIONS>system</SYSTEM_INSTRUCTIONS>"
+                        "<CURRENT_WINDOW_CONTEXT>app.ts</CURRENT_WINDOW_CONTEXT>"
+                        "<CUSTOM_VOCABULARY>VoiceInk</CUSTOM_VOCABULARY>"
+                    ),
+                },
+                {"role": "user", "content": "<TRANSCRIPT>Voice Inc</TRANSCRIPT>"},
+            ],
+        )
+
     def test_eval_loader_uses_last_transcript_tag_pair(self) -> None:
         path = self.write_jsonl([{
             "messages": [
@@ -90,6 +150,32 @@ class ProviderWorkflowTests(unittest.TestCase):
         sample = load_eval_data(path)[0]
 
         self.assertEqual(sample["raw_transcript"], "Actual dictated text.")
+
+    def test_prepared_prompt_tag_examples_are_not_mistaken_for_wrapper(self) -> None:
+        path = self.write_jsonl([{
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Instructions may mention "
+                        "<SYSTEM_INSTRUCTIONS>examples</SYSTEM_INSTRUCTIONS>."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "<CURRENT_WINDOW_CONTEXT>app.ts</CURRENT_WINDOW_CONTEXT>"
+                        "<TRANSCRIPT>hello</TRANSCRIPT>"
+                    ),
+                },
+                {"role": "assistant", "content": "Hello."},
+            ]
+        }])
+
+        sample = load_eval_data(path)[0]
+
+        self.assertTrue(sample["system_text"].startswith("Instructions may mention"))
+        self.assertEqual(sample["window_context"], "app.ts")
 
     def test_select_sample_indices_preserves_requested_order(self) -> None:
         samples = [{"sample_index": index} for index in range(4)]
@@ -143,6 +229,71 @@ class ProviderWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(parse_judge_response(
             with_analysis, require_context_analysis=True
         ))
+
+    def test_strict_judge_response_requires_pairwise_verdict(self) -> None:
+        scores = {dimension: 5 for dimension in SCORE_DIMENSIONS}
+        response = {
+            "output_a": scores,
+            "output_b": scores,
+            "context_analysis": {
+                "output_a": "No material context-sensitive issue.",
+                "output_b": "No material context-sensitive issue.",
+            },
+            "score_analysis": {
+                "output_a": "No material scoring issue.",
+                "output_b": "No material scoring issue.",
+            },
+        }
+
+        self.assertIsNone(parse_judge_response(
+            json.dumps(response),
+            require_context_analysis=True,
+            require_pairwise=True,
+        ))
+        response["pairwise"] = {
+            "preference": "tie",
+            "confidence": "high",
+            "material_difference": False,
+            "reason": "The outputs are equivalent.",
+        }
+        self.assertIsNotNone(parse_judge_response(
+            json.dumps(response),
+            require_context_analysis=True,
+            require_pairwise=True,
+        ))
+
+    def test_aggregate_reports_strict_pairwise_and_material_wins(self) -> None:
+        scores = {dimension: 5 for dimension in SCORE_DIMENSIONS}
+        judgments = [
+            {
+                "baseline_scores": scores,
+                "candidate_scores": scores,
+                "pairwise_preference": "candidate",
+                "pairwise_confidence": "high",
+                "pairwise_material_difference": True,
+            },
+            {
+                "baseline_scores": scores,
+                "candidate_scores": scores,
+                "pairwise_preference": "tie",
+                "pairwise_confidence": "medium",
+                "pairwise_material_difference": False,
+            },
+        ]
+        outputs = [{"duration_ms": 10}, {"duration_ms": 10}]
+
+        summary = aggregate(
+            judgments, outputs, outputs, "baseline", "candidate"
+        )
+
+        self.assertEqual(
+            summary["judge_pairwise"]["preferences"],
+            {"baseline": 0, "candidate": 1, "tie": 1},
+        )
+        self.assertEqual(
+            summary["judge_pairwise"]["material_wins"],
+            {"baseline": 0, "candidate": 1},
+        )
 
     def test_saved_outputs_accept_completed_eval_files(self) -> None:
         path = self.write_jsonl([{

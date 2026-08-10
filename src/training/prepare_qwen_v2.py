@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Build the locked Qwen3.5-2B-VoiceInk-v2 train and evaluation datasets.
+"""Build a locked Qwen3.5-2B VoiceInk train and evaluation dataset.
 
-The legacy regression eval is copied byte-for-byte. A proportional,
+The legacy split's semantic content and ordering are preserved while its
+messages are reconstructed in the requested layout. A proportional,
 length-stratified holdout is selected from the reviewed strategic labels, and
 all remaining unique strategic examples are added to the legacy train set.
 """
@@ -11,7 +12,6 @@ import json
 import math
 import random
 import re
-import shutil
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -21,7 +21,12 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from common.extract import extract_from_record
-from training.prepare_dataset import convert_record
+from training.prepare_dataset import (
+    convert_conversation_layout,
+    convert_record,
+    split_prepared_user,
+    split_voiceink_system,
+)
 
 DEFAULT_BASE_TRAIN = ROOT / "datasets" / "train.jsonl"
 DEFAULT_BASE_EVAL = ROOT / "datasets" / "eval.jsonl"
@@ -33,7 +38,7 @@ DEFAULT_STRATEGIC_MANIFESTS = [
     ROOT / "datasets" / "strategic" / "pilot-100-manifest.jsonl",
     ROOT / "datasets" / "strategic" / "batch-900-manifest.jsonl",
 ]
-DEFAULT_OUTPUT_DIR = ROOT / "datasets" / "qwen35-2b-voiceink-v2"
+DEFAULT_OUTPUT_DIR = ROOT / "datasets" / "qwen35-2b-voiceink-v3"
 DEFAULT_SYSTEM_PROMPT = ROOT / "docs" / "VOICEINK_PROMPT"
 LENGTH_BUCKETS = (
     (0, 50, "0-50"),
@@ -42,7 +47,6 @@ LENGTH_BUCKETS = (
     (200, 500, "200-500"),
     (500, math.inf, "500+"),
 )
-TRANSCRIPT_RE = re.compile(r"<TRANSCRIPT>\s*(.*?)\s*</TRANSCRIPT>", re.DOTALL)
 EMPTY_OPENER_RE = re.compile(r"(?:^|\n\s*)(?:yeah|okay|ok|so)\b", re.IGNORECASE)
 
 
@@ -62,6 +66,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--system-prompt", type=Path, default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--model-name", default="Qwen3.5-2B-VoiceInk-v3")
+    parser.add_argument(
+        "--message-layout",
+        choices=("voiceink", "prepared"),
+        default="voiceink",
+        help="Input message placement for every train/eval conversation",
+    )
     parser.add_argument("--holdout-size", type=int, default=100)
     parser.add_argument(
         "--max-input-chars", type=int, default=40000,
@@ -102,6 +113,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def repo_relative(path: Path) -> str:
+    return str(path.resolve().relative_to(ROOT))
+
+
 def content_text(content) -> str:
     if isinstance(content, str):
         return content
@@ -122,8 +137,82 @@ def message_for_role(conversation: dict, role: str) -> str:
 
 def prepared_transcript(conversation: dict) -> str:
     user = message_for_role(conversation, "user")
-    matches = TRANSCRIPT_RE.findall(user)
-    return (matches[-1] if matches else user).strip()
+    _, transcript_message = split_prepared_user(user)
+    if transcript_message.startswith("<TRANSCRIPT>"):
+        return transcript_message[
+            len("<TRANSCRIPT>"):-len("</TRANSCRIPT>")
+        ].strip()
+    return transcript_message.strip()
+
+
+def assert_layout_only_conversion(source: list[dict], converted: list[dict],
+                                  name: str) -> None:
+    """Prove conversion only relocates messages, never semantic content."""
+    if len(source) != len(converted):
+        raise ValueError(f"{name} count changed during layout conversion")
+    for index, (before, after) in enumerate(zip(source, converted)):
+        roles = [message.get("role") for message in after.get("messages", [])]
+        if roles != ["system", "user", "assistant"]:
+            raise ValueError(f"{name}[{index}] has invalid role sequence: {roles}")
+        before_system = message_for_role(before, "system").strip()
+        before_user = message_for_role(before, "user")
+        context_tail, transcript_message = split_prepared_user(before_user)
+        expected_system = before_system
+        if context_tail:
+            expected_system = f"{expected_system}\n\n{context_tail}"
+        if message_for_role(after, "system") != expected_system:
+            raise ValueError(f"{name}[{index}] context relocation changed bytes")
+        if message_for_role(after, "user") != transcript_message:
+            raise ValueError(f"{name}[{index}] transcript block changed bytes")
+        if message_for_role(before, "assistant") != message_for_role(after, "assistant"):
+            raise ValueError(f"{name}[{index}] assistant label changed")
+
+
+def assert_strategic_production_conversion(source: list[dict], converted: dict,
+                                           system_prompt: str) -> None:
+    """Prove strategic messages match production while labels stay unchanged."""
+    for record in source:
+        conversation = converted[record["request_id"]]
+        request = json.loads(record["raw_request_json"])
+        source_system = next(
+            content_text(message["content"])
+            for message in request["messages"] if message.get("role") == "system"
+        )
+        source_user = next(
+            content_text(message["content"])
+            for message in request["messages"] if message.get("role") == "user"
+        )
+        _, context_tail = split_voiceink_system(source_system)
+        expected_system = system_prompt
+        if context_tail:
+            expected_system = f"{expected_system}\n\n{context_tail}"
+        if message_for_role(conversation, "system") != expected_system:
+            raise ValueError(
+                f"Strategic {record['request_id']} system message changed"
+            )
+        if message_for_role(conversation, "user") != source_user.strip():
+            raise ValueError(
+                f"Strategic {record['request_id']} transcript message changed"
+            )
+        if message_for_role(conversation, "assistant") != record["label"].strip():
+            raise ValueError(
+                f"Strategic {record['request_id']} assistant label changed"
+            )
+
+
+def assert_voiceink_layout(conversations: list[dict], system_prompt: str,
+                           name: str) -> None:
+    """Require the production system-context/user-transcript role placement."""
+    for index, conversation in enumerate(conversations):
+        roles = [message.get("role") for message in conversation.get("messages", [])]
+        system = message_for_role(conversation, "system")
+        user = message_for_role(conversation, "user").strip()
+        if roles != ["system", "user", "assistant"]:
+            raise ValueError(f"{name}[{index}] has invalid roles")
+        if not system.startswith(system_prompt):
+            raise ValueError(f"{name}[{index}] does not use the canonical prompt")
+        if not user.startswith("<TRANSCRIPT>") or not user.endswith("</TRANSCRIPT>"):
+            raise ValueError(f"{name}[{index}] user message is not transcript-only")
 
 
 def normalize_transcript(text: str) -> str:
@@ -310,8 +399,18 @@ def main() -> None:
         print(f"Missing input files: {missing}", file=sys.stderr)
         sys.exit(1)
 
-    base_train = load_jsonl(args.base_train)
-    base_eval = load_jsonl(args.base_eval)
+    base_train_source = load_jsonl(args.base_train)
+    base_eval_source = load_jsonl(args.base_eval)
+    base_train = [
+        convert_conversation_layout(record, args.message_layout)
+        for record in base_train_source
+    ]
+    base_eval = [
+        convert_conversation_layout(record, args.message_layout)
+        for record in base_eval_source
+    ]
+    assert_layout_only_conversion(base_train_source, base_train, "legacy train")
+    assert_layout_only_conversion(base_eval_source, base_eval, "legacy eval")
     strategic_raw = [
         record for path in strategic_inputs for record in load_jsonl(path)
     ]
@@ -343,11 +442,14 @@ def main() -> None:
 
     system_prompt = args.system_prompt.read_text(encoding="utf-8").strip()
     converted = {
-        record["request_id"]: convert_record(record, system_prompt, "text-blocks")
+        record["request_id"]: convert_record(
+            record, system_prompt, "text-blocks", args.message_layout
+        )
         for record in strategic
     }
     if any(value is None for value in converted.values()):
         raise ValueError("A strategic record could not be converted")
+    assert_strategic_production_conversion(strategic, converted, system_prompt)
     strategic_train = [converted[record["request_id"]] for record in strategic_train_source]
     engineering_eval = [converted[record["request_id"]] for record in holdout_source]
 
@@ -382,10 +484,14 @@ def main() -> None:
 
     final_train = base_train + strategic_train
     random.Random(args.seed).shuffle(final_train)
+    assert_voiceink_layout(final_train, system_prompt, "final train")
+    assert_voiceink_layout(base_eval, system_prompt, "regression eval")
+    assert_voiceink_layout(engineering_eval, system_prompt, "engineering eval")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     train_path = args.output_dir / "train.jsonl"
     regression_eval_path = args.output_dir / "eval-regression-340.jsonl"
     engineering_eval_path = args.output_dir / "eval-engineering-100.jsonl"
+    combined_eval_path = args.output_dir / "eval-all-440.jsonl"
     train_manifest_path = args.output_dir / "strategic-train-manifest.jsonl"
     holdout_manifest_path = args.output_dir / "engineering-holdout-manifest.jsonl"
     duplicates_path = args.output_dir / "deduplicated-strategic.jsonl"
@@ -393,8 +499,9 @@ def main() -> None:
     report_path = args.output_dir / "dataset-report.json"
 
     write_jsonl(train_path, final_train)
-    shutil.copy2(args.base_eval, regression_eval_path)
+    write_jsonl(regression_eval_path, base_eval)
     write_jsonl(engineering_eval_path, engineering_eval)
+    write_jsonl(combined_eval_path, base_eval + engineering_eval)
     write_jsonl(train_manifest_path, [
         source_manifest_record(record, strata[record["request_id"]], "train")
         for record in strategic_train_source
@@ -432,7 +539,8 @@ def main() -> None:
     )
     legacy_overlap = len(base_train_fingerprints & base_eval_fingerprints)
     report = {
-        "model_name": "Qwen3.5-2B-VoiceInk-v2",
+        "model_name": args.model_name,
+        "message_layout": args.message_layout,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "seed": args.seed,
         "counts": {
@@ -444,15 +552,31 @@ def main() -> None:
             "overlength_strategic": len(overlength_source),
             "strategic_train": len(strategic_train),
             "engineering_holdout": len(engineering_eval),
+            "combined_eval": len(base_eval) + len(engineering_eval),
             "final_train": len(final_train),
         },
         "holdout_strata": dict(Counter(
             strata[record["request_id"]] for record in holdout_source
         )),
         "integrity": {
-            "locked_eval_byte_identical": (
-                sha256_file(args.base_eval) == sha256_file(regression_eval_path)
+            "locked_eval_transcript_order_identical": (
+                [prepared_transcript(record) for record in base_eval_source]
+                == [prepared_transcript(record) for record in base_eval]
             ),
+            "locked_eval_labels_identical": (
+                [message_for_role(record, "assistant") for record in base_eval_source]
+                == [message_for_role(record, "assistant") for record in base_eval]
+            ),
+            "locked_eval_layout_only_conversion": (
+                all(
+                    prepared_transcript(before) == prepared_transcript(after)
+                    and message_for_role(before, "assistant")
+                    == message_for_role(after, "assistant")
+                    for before, after in zip(base_eval_source, base_eval)
+                )
+            ),
+            "strategic_raw_production_messages_exact": True,
+            "all_outputs_use_voiceink_layout": True,
             "legacy_train_eval_normalized_overlap": legacy_overlap,
             "new_overlap_with_legacy_train": 0,
             "new_overlap_with_locked_eval": 0,
@@ -466,18 +590,19 @@ def main() -> None:
         },
         "distributions": distributions,
         "sources": {
-            str(path.relative_to(ROOT)): {
+            repo_relative(path): {
                 "count": len(load_jsonl(path)) if path.suffix == ".jsonl" else None,
                 "sha256": sha256_file(path),
             }
             for path in required
         },
         "outputs": {
-            str(path.relative_to(ROOT)): {
+            repo_relative(path): {
                 "sha256": sha256_file(path),
             }
             for path in (
                 train_path, regression_eval_path, engineering_eval_path,
+                combined_eval_path,
                 train_manifest_path, holdout_manifest_path, duplicates_path,
                 overlength_path,
             )
@@ -487,11 +612,19 @@ def main() -> None:
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
 
-    print("Qwen3.5-2B-VoiceInk-v2 dataset")
+    print(f"{args.model_name} dataset")
+    print(f"  message layout: {args.message_layout}")
     for name, count in report["counts"].items():
         print(f"  {name}: {count}")
     print(f"  holdout strata: {report['holdout_strata']}")
-    print(f"  locked eval byte-identical: {report['integrity']['locked_eval_byte_identical']}")
+    print(
+        "  locked eval transcript order identical: "
+        f"{report['integrity']['locked_eval_transcript_order_identical']}"
+    )
+    print(
+        "  locked eval labels identical: "
+        f"{report['integrity']['locked_eval_labels_identical']}"
+    )
     print(f"  legacy train/eval overlap retained: {legacy_overlap}")
     print(f"  new leakage: 0")
     print(f"  holdout max length-bucket drift: {max_holdout_drift:.1f}pp")

@@ -36,17 +36,30 @@ unsloth_compiled_cache/
 training/lora/
 training/outputs/
 training/lfm25/
+training/lfm25-1.2b-voiceink-v3/
 training/lfm25-2.6b-base/
 training/qwen35-2b-voiceink-v2/
+training/qwen35-2b-voiceink-v3/
+training/qwen35-08b-voiceink-v1/
+training/qwen35-2b-voiceink-sft1-control/
+training/qwen35-2b-voiceink-dpo-v1/
 
 # Reproducible private Qwen v2 split and report
 datasets/qwen35-2b-voiceink-v2/
+datasets/qwen35-2b-voiceink-v3/
+datasets/lfm25-v3/
+datasets/qwen35-2b-voiceink-dpo/
 
 # Unsloth merged/exported model artifacts
 models/Qwen3.5-2B-voiceink*/
 models/Qwen3.5-2B-VoiceInk-v2*/
+models/Qwen3.5-2B-VoiceInk-v3*/
+models/Qwen3.5-0.8B-VoiceInk-v1*/
+models/Qwen3.5-2B-VoiceInk-sft1-control*/
+models/Qwen3.5-2B-VoiceInk-dpo-v1*/
 models/LFM2.5-1.2B-VoiceInk*/
 models/LFM2.5-2.6B-VoiceInk*/
+models/LFM2.5-8B-A1B-GGUF/
 
 # Eval results
 results/

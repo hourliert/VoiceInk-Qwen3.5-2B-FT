@@ -12,16 +12,25 @@ from src.training.finetune_lfm25 import (
     parse_args,
     render_conversations,
 )
+from src.training.finetune_lfm25_12b_v3 import parse_args as parse_lfm_v3_args
 from src.training.finetune import (
+    align_step_interval,
     compute_fused_eval_loss,
+    expected_training_steps,
     parse_args as parse_qwen_args,
 )
-from src.training.prepare_dataset import convert_record
+from src.training.finetune_qwen35_08b import parse_args as parse_qwen_08b_args
+from src.training.prepare_dataset import (
+    content_text,
+    convert_conversation_layout,
+    convert_record,
+)
 from src.training.prepare_qwen_v2 import (
     deduplicate_strategic,
     proportional_allocation,
     select_length_stratified_holdout,
 )
+from src.training.prepare_lfm25_v3 import convert_conversation
 from src.training.show_distribution import is_training_approved
 
 
@@ -60,10 +69,13 @@ class PrepareDatasetTests(unittest.TestCase):
     def test_default_format_preserves_qwen_text_blocks(self) -> None:
         converted = convert_record(labeled_record(), "new prompt")
 
-        self.assertEqual(
-            converted["messages"][0]["content"],
-            [{"type": "text", "text": "new prompt"}],
-        )
+        system = content_text(converted["messages"][0]["content"])
+        user = content_text(converted["messages"][1]["content"])
+        self.assertIn("<SYSTEM_INSTRUCTIONS>\nnew prompt", system)
+        self.assertIn("<CURRENT_WINDOW_CONTEXT>Terminal", system)
+        self.assertIn("<CUSTOM_VOCABULARY>VoiceInk", system)
+        self.assertNotIn("CURRENT_WINDOW_CONTEXT", user)
+        self.assertEqual(user, "<TRANSCRIPT>um test voice ink please</TRANSCRIPT>")
 
     def test_string_format_builds_lfm_conversation(self) -> None:
         converted = convert_record(labeled_record(), "new prompt", "string")
@@ -76,9 +88,35 @@ class PrepareDatasetTests(unittest.TestCase):
             all(isinstance(message["content"], str)
                 for message in converted["messages"])
         )
-        self.assertIn("<CURRENT_WINDOW_CONTEXT>", converted["messages"][1]["content"])
+        self.assertIn("<CURRENT_WINDOW_CONTEXT>", converted["messages"][0]["content"])
         self.assertIn("<TRANSCRIPT>", converted["messages"][1]["content"])
         self.assertEqual(converted["messages"][2]["content"], "Test VoiceInk, please.")
+
+    def test_prepared_layout_remains_available_for_legacy_experiments(self) -> None:
+        converted = convert_record(
+            labeled_record(), "new prompt", message_layout="prepared"
+        )
+
+        system = content_text(converted["messages"][0]["content"])
+        user = content_text(converted["messages"][1]["content"])
+        self.assertEqual(system, "new prompt")
+        self.assertIn("<CURRENT_WINDOW_CONTEXT>", user)
+        self.assertIn("<TRANSCRIPT>", user)
+
+    def test_layout_conversion_preserves_context_transcript_and_label(self) -> None:
+        prepared = convert_record(
+            labeled_record(), "new prompt", message_layout="prepared"
+        )
+
+        production = convert_conversation_layout(prepared, "voiceink")
+
+        system = content_text(production["messages"][0]["content"])
+        user = content_text(production["messages"][1]["content"])
+        assistant = content_text(production["messages"][2]["content"])
+        self.assertIn("<CURRENT_WINDOW_CONTEXT>\nTerminal", system)
+        self.assertIn("<CUSTOM_VOCABULARY>\nVoiceInk", system)
+        self.assertEqual(user, "<TRANSCRIPT>\num test voice ink please\n</TRANSCRIPT>")
+        self.assertEqual(assistant, "Test VoiceInk, please.")
 
     def test_proportional_holdout_preserves_strategic_mix(self) -> None:
         self.assertEqual(
@@ -190,8 +228,86 @@ class LfmTrainerInputTests(unittest.TestCase):
         self.assertIn("lfm25-2.6b-base", str(args.output_dir))
         self.assertEqual(args.gguf_base.name, "LFM2.5-2.6B-VoiceInk")
 
+    def test_lfm_v3_profile_uses_locked_samples_and_faster_batches(self) -> None:
+        args = parse_lfm_v3_args(["--check-only"])
+
+        self.assertEqual(str(args.train), "datasets/lfm25-v3/train.jsonl")
+        self.assertEqual(
+            str(args.eval), "datasets/lfm25-v3/eval-regression-340.jsonl"
+        )
+        self.assertEqual((args.batch_size, args.grad_accum), (4, 2))
+        self.assertEqual(args.eval_batch_size, 4)
+        self.assertTrue(args.load_best_model_at_end)
+        self.assertIn("lfm25-1.2b-voiceink-v3", str(args.output_dir))
+        self.assertEqual(args.gguf_base.name, "LFM2.5-1.2B-VoiceInk-v3")
+
+    def test_lfm_v3_conversion_only_changes_content_representation(self) -> None:
+        source = convert_record(labeled_record(), "new prompt")
+        converted = convert_conversation(source, Path("source.jsonl"), 1)
+
+        self.assertEqual(
+            [message["role"] for message in converted["messages"]],
+            ["system", "user", "assistant"],
+        )
+        for original, result in zip(source["messages"], converted["messages"]):
+            self.assertEqual(content_text(original["content"]), result["content"])
+            self.assertIsInstance(result["content"], str)
+
 
 class QwenTrainerProfileTests(unittest.TestCase):
+    def test_08b_profile_reuses_locked_v3_data_with_isolated_outputs(self) -> None:
+        args = parse_qwen_08b_args(["--check-only"])
+
+        self.assertEqual(args.base_model, "unsloth/Qwen3.5-0.8B")
+        self.assertEqual(
+            str(args.train), "datasets/qwen35-2b-voiceink-v3/train.jsonl"
+        )
+        self.assertEqual(
+            str(args.eval),
+            "datasets/qwen35-2b-voiceink-v3/eval-regression-340.jsonl",
+        )
+        self.assertEqual(args.epochs, 1)
+        self.assertEqual((args.r, args.lora_alpha), (32, 64))
+        self.assertEqual((args.batch_size, args.grad_accum), (4, 2))
+        self.assertEqual(args.batch_size * args.grad_accum, 8)
+        self.assertEqual(args.eval_batch_size, 4)
+        self.assertEqual((args.eval_steps, args.save_steps), (50, 50))
+        self.assertIn("qwen35-08b-voiceink-v1", str(args.lora_dir))
+        self.assertEqual(args.gguf_base.name, "Qwen3.5-0.8B-VoiceInk-v1")
+        self.assertTrue(args.check_only)
+
+    def test_08b_profile_allows_smoke_output_overrides(self) -> None:
+        args = parse_qwen_08b_args([
+            "--max-steps", "1",
+            "--lora-dir", "training/qwen35-08b-voiceink-v1/smoke-lora",
+            "--output-dir", "training/qwen35-08b-voiceink-v1/smoke-outputs",
+        ])
+
+        self.assertEqual(args.max_steps, 1)
+        self.assertIn("smoke-lora", str(args.lora_dir))
+        self.assertIn("smoke-outputs", str(args.output_dir))
+
+    def test_08b_profile_plans_496_steps_with_faster_micro_batches(self) -> None:
+        args = parse_qwen_08b_args([])
+
+        total = expected_training_steps(
+            3962,
+            args.batch_size,
+            args.grad_accum,
+            args.epochs,
+            args.max_steps,
+        )
+
+        self.assertEqual(total, 496)
+        self.assertEqual(align_step_interval(total, args.eval_steps), 62)
+
+    def test_eval_interval_is_unchanged_when_terminal_step_already_aligns(self) -> None:
+        self.assertEqual(align_step_interval(500, 50), 50)
+
+    def test_max_steps_controls_terminal_eval_alignment(self) -> None:
+        self.assertEqual(expected_training_steps(3962, 4, 2, 1, 7), 7)
+        self.assertEqual(align_step_interval(7, 50), 7)
+
     def test_v2_paths_and_recipe_can_be_isolated_from_production(self) -> None:
         args = parse_qwen_args([
             "--train", "datasets/qwen35-2b-voiceink-v2/train.jsonl",

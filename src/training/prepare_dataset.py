@@ -46,11 +46,21 @@ def parse_args() -> argparse.Namespace:
                    default="text-blocks",
                    help="Message content representation: text-blocks for Qwen VLMs "
                         "(default), string for text-only models such as LFM2.5")
+    p.add_argument(
+        "--message-layout",
+        choices=("voiceink", "prepared"),
+        default="voiceink",
+        help=(
+            "Message placement: voiceink reproduces production with instructions "
+            "and context in system, transcript in user (default); prepared keeps "
+            "the legacy training-only layout"
+        ),
+    )
     return p.parse_args()
 
 
 def build_user_message(components: dict) -> str:
-    """Reconstruct the user message from extracted components."""
+    """Reconstruct the legacy prepared-layout user message."""
     parts = []
 
     if components["window_context"]:
@@ -67,6 +77,34 @@ def build_user_message(components: dict) -> str:
     return "\n\n".join(parts)
 
 
+def build_voiceink_system_message(components: dict, system_prompt: str) -> str:
+    """Reconstruct the system message structure sent by VoiceInk in production."""
+    stripped_prompt = system_prompt.strip()
+    if (
+        stripped_prompt.startswith("<SYSTEM_INSTRUCTIONS>")
+        and stripped_prompt.endswith("</SYSTEM_INSTRUCTIONS>")
+    ):
+        wrapped_prompt = stripped_prompt
+    else:
+        wrapped_prompt = (
+            f"<SYSTEM_INSTRUCTIONS>\n{stripped_prompt}\n</SYSTEM_INSTRUCTIONS>"
+        )
+    parts = [wrapped_prompt]
+    for tag, field in (
+        ("CURRENT_WINDOW_CONTEXT", "window_context"),
+        ("CLIPBOARD_CONTEXT", "clipboard_context"),
+        ("CUSTOM_VOCABULARY", "custom_vocabulary"),
+    ):
+        if components[field]:
+            parts.append(f"<{tag}>\n{components[field]}\n</{tag}>")
+    return "\n\n".join(parts)
+
+
+def build_voiceink_user_message(components: dict) -> str:
+    """Reconstruct the transcript-only user message sent by VoiceInk."""
+    return f"<TRANSCRIPT>\n{components['transcript']}\n</TRANSCRIPT>"
+
+
 def message_content(text: str, content_format: str) -> str | list[dict]:
     """Represent message text in the format expected by the target model."""
     if content_format == "string":
@@ -74,8 +112,115 @@ def message_content(text: str, content_format: str) -> str | list[dict]:
     return [{"type": "text", "text": text}]
 
 
+def content_text(content) -> str:
+    """Extract text from a string or typed text blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    raise ValueError(f"Unsupported message content: {type(content).__name__}")
+
+
+def extract_last_tag_content(text: str, tag: str) -> str:
+    """Extract the last complete tag pair, avoiding prompt examples."""
+    opening = f"<{tag}>"
+    closing = f"</{tag}>"
+    close_index = text.rfind(closing)
+    if close_index < 0:
+        return ""
+    open_index = text.rfind(opening, 0, close_index)
+    if open_index < 0:
+        return ""
+    return text[open_index + len(opening):close_index].strip()
+
+
+def split_voiceink_system(text: str) -> tuple[str, str]:
+    """Split the outer instructions wrapper from the exact dynamic-context tail."""
+    stripped = text.strip()
+    closing = "</SYSTEM_INSTRUCTIONS>"
+    close_index = stripped.find(closing)
+    if not stripped.startswith("<SYSTEM_INSTRUCTIONS>") or close_index < 0:
+        return stripped, ""
+    boundary = close_index + len(closing)
+    return stripped[:boundary], stripped[boundary:].strip()
+
+
+def split_prepared_user(text: str) -> tuple[str, str]:
+    """Split legacy context blocks from its final outer transcript block."""
+    stripped = text.strip()
+    if stripped.startswith("<TRANSCRIPT>"):
+        return "", stripped
+
+    marker = "\n\n<TRANSCRIPT>"
+    search_from = 0
+    candidates = []
+    while True:
+        index = stripped.find(marker, search_from)
+        if index < 0:
+            break
+        prefix = stripped[:index].rstrip()
+        if any(
+            prefix.endswith(f"</{tag}>")
+            for tag in (
+                "CURRENT_WINDOW_CONTEXT",
+                "CLIPBOARD_CONTEXT",
+                "CUSTOM_VOCABULARY",
+            )
+        ):
+            candidates.append(index)
+        search_from = index + len(marker)
+    if not candidates:
+        raise ValueError("Could not find the outer transcript block")
+    boundary = candidates[-1]
+    return stripped[:boundary].strip(), stripped[boundary + 2:].strip()
+
+
+def convert_conversation_layout(conversation: dict, message_layout: str) -> dict:
+    """Re-layout an existing prepared conversation without changing its label."""
+    messages = conversation.get("messages", [])
+    if [message.get("role") for message in messages] != [
+        "system", "user", "assistant"
+    ]:
+        raise ValueError("Conversation must contain system, user, assistant roles")
+
+    system_text = content_text(messages[0]["content"])
+    user_text = content_text(messages[1]["content"])
+    assistant_text = content_text(messages[2]["content"])
+    content_format = "string" if isinstance(messages[0]["content"], str) else "text-blocks"
+
+    if message_layout == "voiceink":
+        context_tail, transcript_message = split_prepared_user(user_text)
+        new_system = system_text.strip()
+        if context_tail:
+            new_system = f"{new_system}\n\n{context_tail}"
+        new_user = transcript_message
+    elif message_layout == "prepared":
+        system_prompt, context_tail = split_voiceink_system(system_text)
+        new_system = system_prompt
+        new_user = "\n\n".join(
+            part for part in (context_tail, user_text.strip()) if part
+        )
+    else:
+        raise ValueError(f"Unsupported message layout: {message_layout}")
+    return {
+        "messages": [
+            {"role": "system", "content": message_content(new_system, content_format)},
+            {"role": "user", "content": message_content(new_user, content_format)},
+            {
+                "role": "assistant",
+                "content": message_content(assistant_text, content_format),
+            },
+        ]
+    }
+
+
 def convert_record(record: dict, system_prompt: str,
-                   content_format: str = "text-blocks") -> dict | None:
+                   content_format: str = "text-blocks",
+                   message_layout: str = "voiceink") -> dict | None:
     """Convert a labeled record to chat messages format.
 
     Extracts structured components from the original request, then
@@ -95,12 +240,44 @@ def convert_record(record: dict, system_prompt: str,
     if not label or not components["transcript"]:
         return None
 
-    user_content = build_user_message(components)
+    if message_layout == "voiceink":
+        try:
+            request = json.loads(record["raw_request_json"])
+            source_messages = request.get("messages", [])
+            source_system = next(
+                content_text(message["content"])
+                for message in source_messages if message.get("role") == "system"
+            )
+            source_user = next(
+                content_text(message["content"])
+                for message in source_messages if message.get("role") == "user"
+            )
+            _, context_tail = split_voiceink_system(source_system)
+            empty_components = {
+                "window_context": "",
+                "clipboard_context": "",
+                "custom_vocabulary": "",
+                "transcript": "",
+            }
+            system_content = build_voiceink_system_message(
+                empty_components, system_prompt
+            )
+            if context_tail:
+                system_content = f"{system_content}\n\n{context_tail}"
+            user_content = source_user.strip()
+        except (KeyError, StopIteration, TypeError, ValueError):
+            system_content = build_voiceink_system_message(components, system_prompt)
+            user_content = build_voiceink_user_message(components)
+    elif message_layout == "prepared":
+        system_content = system_prompt
+        user_content = build_user_message(components)
+    else:
+        raise ValueError(f"Unsupported message layout: {message_layout}")
 
     messages = [
         {
             "role": "system",
-            "content": message_content(system_prompt, content_format),
+            "content": message_content(system_content, content_format),
         },
         {
             "role": "user",
@@ -177,7 +354,9 @@ def main() -> None:
     converted = []
     skipped = 0
     for record in records:
-        result = convert_record(record, system_prompt, args.content_format)
+        result = convert_record(
+            record, system_prompt, args.content_format, args.message_layout
+        )
         if result:
             converted.append(result)
         else:
