@@ -27,6 +27,15 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from common.mlflow_tracking import (  # noqa: E402
+    add_mlflow_args,
+    dataset_metadata,
+    output_reference,
+    start_mlflow_run,
+)
+
 DEFAULT_TRAIN = ROOT / "datasets" / "train.jsonl"
 DEFAULT_EVAL = ROOT / "datasets" / "eval.jsonl"
 DEFAULT_LORA_DIR = ROOT / "training" / "lora"
@@ -100,6 +109,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--check-only", action="store_true",
         help="Validate and print the training configuration without loading a model",
     )
+    add_mlflow_args(p, default_experiment="voiceink-training")
 
     return p.parse_args(argv)
 
@@ -352,7 +362,7 @@ def main(argv=None) -> None:
         return
 
     # Snapshot labeled data for reproducibility
-    snapshot_labeled_data()
+    dataset_snapshot = snapshot_labeled_data()
 
     # ---- Load model (VLM — Qwen 3.5 is a unified vision-language model) ----
     from unsloth import FastVisionModel
@@ -390,6 +400,46 @@ def main(argv=None) -> None:
     FastVisionModel.for_training(model)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    tracking = start_mlflow_run(
+        args,
+        run_name=args.gguf_base.name,
+        run_kind="training.sft.qwen",
+        params={
+            "base_model": args.base_model,
+            "max_seq_length": args.max_seq_length,
+            "precision": (
+                "4bit" if args.load_in_4bit else
+                "8bit" if args.load_in_8bit else "bf16"
+            ),
+            "lora_r": args.r,
+            "lora_alpha": args.lora_alpha,
+            "epochs": args.epochs,
+            "max_steps": args.max_steps,
+            "planned_optimizer_steps": planned_steps,
+            "batch_size": args.batch_size,
+            "gradient_accumulation_steps": args.grad_accum,
+            "effective_batch_size": args.batch_size * args.grad_accum,
+            "eval_batch_size": args.eval_batch_size,
+            "learning_rate": args.lr,
+            "warmup_steps": args.warmup_steps,
+            "eval_steps": args.eval_steps,
+            "save_steps": args.save_steps,
+            "load_best_model_at_end": args.load_best_model_at_end,
+            "dataset_snapshot": dataset_snapshot or "",
+            "output_dir": args.output_dir,
+            "lora_dir": args.lora_dir,
+            "gguf_base": args.gguf_base,
+            "gguf_quantizations": args.export_gguf or [],
+        },
+        datasets=[
+            dataset_metadata("train", args.train, len(train_data)),
+            *(
+                [dataset_metadata("training_regression_eval", args.eval, len(eval_data))]
+                if eval_data is not None else []
+            ),
+        ],
+    )
 
     class LossOnlyEvalSFTTrainer(SFTTrainer):
         """Evaluate fused cross-entropy without materializing vocabulary logits.
@@ -433,7 +483,8 @@ def main(argv=None) -> None:
             lr_scheduler_type="cosine",
             seed=3407,
             output_dir=str(args.output_dir),
-            report_to="none",
+            report_to="mlflow" if tracking.enabled else "none",
+            run_name=tracking.run_name,
             # Evaluation during training (detect overfitting)
             eval_strategy="steps" if eval_data else "no",
             eval_steps=args.eval_steps,
@@ -467,6 +518,7 @@ def main(argv=None) -> None:
         str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
     )
     trainer_stats = trainer.train(resume_from_checkpoint=resume_checkpoint)
+    tracking.log_metrics(trainer_stats.metrics)
 
     # Report stats
     used_memory = round(torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3)
@@ -478,6 +530,7 @@ def main(argv=None) -> None:
     if args.load_best_model_at_end:
         print(f"  Best eval loss: {trainer.state.best_metric}")
         print(f"  Best checkpoint: {trainer.state.best_model_checkpoint}")
+        tracking.log_metrics({"best_eval_loss": trainer.state.best_metric})
 
     # ---- Save LoRA adapter ----
     args.lora_dir.mkdir(parents=True, exist_ok=True)
@@ -519,6 +572,48 @@ def main(argv=None) -> None:
         )
         print(f"GGUF export complete: {gguf_final}")
 
+    tracking.log_dict(
+        {
+            "global_step": trainer.state.global_step,
+            "epoch": trainer.state.epoch,
+            "best_metric": trainer.state.best_metric,
+            "best_model_checkpoint": trainer.state.best_model_checkpoint,
+            "log_history": trainer.state.log_history,
+        },
+        "training/trainer_state.json",
+    )
+    tracking.log_dict(
+        {
+            "outputs": [
+                output_reference("checkpoints", args.output_dir, private=False),
+                output_reference("lora_adapter", args.lora_dir, private=False),
+                *(
+                    [output_reference("gguf_export", gguf_final, private=False)]
+                    if args.export_gguf is not None else []
+                ),
+            ]
+        },
+        "metadata/outputs.json",
+    )
+    tracking.log_external_model(
+        name=args.gguf_base.name,
+        model_type="voiceink-transcript-cleanup",
+        params={
+            "base_model": args.base_model,
+            "lora_dir": args.lora_dir,
+            "gguf_dir": (
+                gguf_final if args.export_gguf is not None else "not-exported"
+            ),
+            "quantizations": args.export_gguf or [],
+        },
+        tags={"voiceink.training_family": "qwen-sft"},
+        metrics={
+            **trainer_stats.metrics,
+            "best_eval_loss": trainer.state.best_metric,
+        },
+        dataset_role="training_regression_eval",
+    )
+    tracking.finish()
     print("\nDone!")
 
 

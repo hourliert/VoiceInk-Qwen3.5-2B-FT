@@ -19,6 +19,15 @@ except ImportError:
     from finetune import align_final_eval_schedule, compute_fused_eval_loss
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from common.mlflow_tracking import (  # noqa: E402
+    add_mlflow_args,
+    dataset_metadata,
+    output_reference,
+    start_mlflow_run,
+)
+
 DEFAULT_TRAIN = ROOT / "datasets" / "lfm25" / "train.jsonl"
 DEFAULT_EVAL = ROOT / "datasets" / "lfm25" / "eval.jsonl"
 DEFAULT_LORA_DIR = ROOT / "training" / "lfm25" / "lora"
@@ -101,6 +110,10 @@ def parse_args(
     parser.add_argument("--eval-steps", type=int, default=50)
     parser.add_argument("--save-steps", type=int, default=50)
     parser.add_argument("--load-best-model-at-end", action="store_true")
+    parser.add_argument(
+        "--skip-eval", action="store_true",
+        help="Disable evaluation for a quick smoke test",
+    )
     parser.add_argument("--resume-from-checkpoint", type=Path)
 
     parser.add_argument("--lora-dir", type=Path, default=profile.lora_dir)
@@ -114,6 +127,7 @@ def parse_args(
         "--check-only", action="store_true",
         help="Validate datasets and print configuration without loading or training a model",
     )
+    add_mlflow_args(parser, default_experiment="voiceink-training")
     parser.set_defaults(profile_name=profile.name)
     return parser.parse_args(argv)
 
@@ -244,7 +258,7 @@ def main(
 
     train_conversations = load_conversations(args.train)
     eval_conversations = None
-    if args.eval and args.eval.is_file():
+    if not args.skip_eval and args.eval and args.eval.is_file():
         eval_conversations = load_conversations(args.eval)
 
     planned_steps = align_final_eval_schedule(
@@ -297,6 +311,49 @@ def main(
     )
     bf16 = is_bfloat16_supported()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    tracking = start_mlflow_run(
+        args,
+        run_name=args.gguf_base.name,
+        run_kind="training.sft.lfm",
+        params={
+            "profile": profile.name,
+            "base_model": args.base_model,
+            "max_seq_length": args.max_seq_length,
+            "precision": (
+                "4bit" if args.load_in_4bit else
+                "8bit" if args.load_in_8bit else "bf16"
+            ),
+            "lora_r": args.r,
+            "lora_alpha": args.lora_alpha,
+            "lora_targets": LORA_TARGET_MODULES,
+            "epochs": args.epochs,
+            "max_steps": args.max_steps,
+            "planned_optimizer_steps": planned_steps,
+            "batch_size": args.batch_size,
+            "gradient_accumulation_steps": args.grad_accum,
+            "effective_batch_size": args.batch_size * args.grad_accum,
+            "eval_batch_size": args.eval_batch_size,
+            "learning_rate": args.lr,
+            "warmup_steps": args.warmup_steps,
+            "eval_steps": args.eval_steps,
+            "save_steps": args.save_steps,
+            "load_best_model_at_end": args.load_best_model_at_end,
+            "output_dir": args.output_dir,
+            "lora_dir": args.lora_dir,
+            "gguf_base": args.gguf_base,
+            "gguf_quantizations": args.export_gguf or [],
+        },
+        datasets=[
+            dataset_metadata("train", args.train, len(train_conversations)),
+            *(
+                [dataset_metadata(
+                    "training_regression_eval", args.eval, len(eval_conversations)
+                )]
+                if eval_conversations is not None else []
+            ),
+        ],
+    )
+
     class LossOnlyEvalSFTTrainer(SFTTrainer):
         """Evaluate fused loss without retaining full-vocabulary logits."""
 
@@ -331,7 +388,8 @@ def main(
             lr_scheduler_type="cosine",
             seed=3407,
             output_dir=str(args.output_dir),
-            report_to="none",
+            report_to="mlflow" if tracking.enabled else "none",
+            run_name=tracking.run_name,
             eval_strategy="steps" if eval_data else "no",
             eval_steps=args.eval_steps,
             prediction_loss_only=True,
@@ -365,6 +423,7 @@ def main(
         str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None
     )
     stats = trainer.train(resume_from_checkpoint=resume_checkpoint)
+    tracking.log_metrics(stats.metrics)
     peak_memory = torch.cuda.max_memory_reserved() / 1024 ** 3
     runtime = stats.metrics.get("train_runtime", 0)
     print(f"\nTraining complete in {runtime / 60:.1f} minutes")
@@ -372,6 +431,7 @@ def main(
     if args.load_best_model_at_end:
         print(f"Best eval loss: {trainer.state.best_metric}")
         print(f"Best checkpoint: {trainer.state.best_model_checkpoint}")
+        tracking.log_metrics({"best_eval_loss": trainer.state.best_metric})
 
     args.lora_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving LoRA adapter to {args.lora_dir}")
@@ -387,6 +447,50 @@ def main(
             str(args.gguf_base), tokenizer, quantization_method=methods
         )
         print(f"GGUF export complete: {final_directory}")
+
+    tracking.log_dict(
+        {
+            "global_step": trainer.state.global_step,
+            "epoch": trainer.state.epoch,
+            "best_metric": trainer.state.best_metric,
+            "best_model_checkpoint": trainer.state.best_model_checkpoint,
+            "log_history": trainer.state.log_history,
+        },
+        "training/trainer_state.json",
+    )
+    tracking.log_dict(
+        {
+            "outputs": [
+                output_reference("checkpoints", args.output_dir, private=False),
+                output_reference("lora_adapter", args.lora_dir, private=False),
+                *(
+                    [output_reference("gguf_export", final_directory, private=False)]
+                    if args.export_gguf is not None else []
+                ),
+            ]
+        },
+        "metadata/outputs.json",
+    )
+    tracking.log_external_model(
+        name=args.gguf_base.name,
+        model_type="voiceink-transcript-cleanup",
+        params={
+            "base_model": args.base_model,
+            "profile": profile.name,
+            "lora_dir": args.lora_dir,
+            "gguf_dir": (
+                final_directory if args.export_gguf is not None else "not-exported"
+            ),
+            "quantizations": args.export_gguf or [],
+        },
+        tags={"voiceink.training_family": "lfm-sft"},
+        metrics={
+            **stats.metrics,
+            "best_eval_loss": trainer.state.best_metric,
+        },
+        dataset_role="training_regression_eval",
+    )
+    tracking.finish()
 
 
 if __name__ == "__main__":

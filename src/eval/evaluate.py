@@ -34,6 +34,12 @@ from common.llm_cli import (
     provider_prompt_path,
     resolve_model,
 )
+from common.mlflow_tracking import (  # noqa: E402
+    add_mlflow_args,
+    dataset_metadata,
+    output_reference,
+    start_mlflow_run,
+)
 from training.prepare_dataset import (
     build_user_message,
     build_voiceink_system_message,
@@ -139,6 +145,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Generate and save model outputs, then exit before judging")
     p.add_argument("--dry-run", action="store_true",
                    help="Print judge prompts without calling the configured provider")
+    add_mlflow_args(p, default_experiment="voiceink-evaluation")
     return p.parse_args(argv)
 
 
@@ -944,7 +951,7 @@ def write_generation_outputs(path: Path, samples: list[dict],
 
 def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[dict],
                   candidate_outputs: list[dict], judgments: list[dict],
-                  summary: dict, judge_metadata: dict) -> None:
+                  summary: dict, judge_metadata: dict) -> tuple[Path, Path]:
     """Write per-sample results and summary to files."""
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -987,6 +994,7 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"Summary: {summary_path}")
+    return detail_path, summary_path
 
 
 # ---- Main ----
@@ -1057,6 +1065,46 @@ def main() -> None:
         samples = samples[:args.limit]
     print(f"Loaded {len(samples)} eval samples")
 
+    mode = "generation" if args.generate_only else "quality"
+    tracking = start_mlflow_run(
+        args,
+        run_name=f"{args.candidate}-vs-{args.baseline}-{args.judge_rubric}-{mode}",
+        run_kind=f"evaluation.{mode}",
+        params={
+            "baseline_model": args.baseline,
+            "candidate_model": args.candidate,
+            "eval_samples": len(samples),
+            "canonical_eval": not args.allow_noncanonical_eval,
+            "baseline_temperature": args.baseline_temperature,
+            "candidate_temperature": args.candidate_temperature,
+            "inference_seed": args.inference_seed if args.inference_seed is not None else "",
+            "baseline_message_layout": args.baseline_message_layout,
+            "candidate_message_layout": args.candidate_message_layout,
+            "judge_provider": args.judge_provider,
+            "judge_model": judge_model,
+            "judge_reasoning_effort": args.judge_reasoning_effort,
+            "judge_rubric": args.judge_rubric,
+            "judge_prompt_sha256": judge_metadata.get("prompt_sha256", ""),
+            "parallel": args.parallel,
+            "seed": args.seed,
+            "dry_run": args.dry_run,
+            "resume": args.resume or "",
+            "saved_outputs": args.outputs or "",
+            "output_dir": args.output_dir,
+        },
+        datasets=[dataset_metadata("full_quality_eval", args.eval_data, len(load_eval_data(args.eval_data)))],
+        tags={
+            "voiceink.baseline_model": args.baseline,
+            "voiceink.candidate_model": args.candidate,
+        },
+    )
+    if judge_template:
+        tracking.register_prompt(
+            name=f"voiceink-{args.judge_rubric}-{args.judge_provider}-judge",
+            template=judge_template,
+            sha256=judge_metadata["prompt_sha256"],
+        )
+
     # Load cache from previous run if resuming
     cache = {}
     if args.resume:
@@ -1116,6 +1164,7 @@ def main() -> None:
             "pairwise_reason": c.get("pairwise_reason"),
         }
 
+    generation_path = None
     if args.outputs:
         if not args.outputs.is_file():
             print(f"Saved outputs not found: {args.outputs}", file=sys.stderr)
@@ -1188,6 +1237,25 @@ def main() -> None:
         )
 
     if args.generate_only:
+        tracking.log_metrics({
+            "samples": len(samples),
+            "baseline_latency": _latency_stats(sorted(
+                output["duration_ms"] for output in baseline_outputs
+                if output and output.get("duration_ms")
+            )),
+            "candidate_latency": _latency_stats(sorted(
+                output["duration_ms"] for output in candidate_outputs
+                if output and output.get("duration_ms")
+            )),
+        })
+        if generation_path is not None:
+            tracking.log_dict(
+                {"outputs": [output_reference(
+                    "private_generations", generation_path, private=True
+                )]},
+                "metadata/outputs.json",
+            )
+        tracking.finish()
         print("Generation-only run complete; no judge was called.")
         return
 
@@ -1242,6 +1310,8 @@ def main() -> None:
         print("\nAll samples cached, skipping inference and judging.")
 
     if args.dry_run:
+        tracking.set_tags({"voiceink.dry_run": "true"})
+        tracking.finish()
         print("\nDry run complete.")
         return
 
@@ -1267,9 +1337,27 @@ def main() -> None:
     print_summary(summary)
 
     # Write results
-    write_results(args.output_dir, filtered_samples, filtered_baseline,
-                  filtered_candidate, filtered_judgments, summary,
-                  judge_metadata)
+    detail_path, summary_path = write_results(
+        args.output_dir, filtered_samples, filtered_baseline,
+        filtered_candidate, filtered_judgments, summary, judge_metadata,
+    )
+    tracking.log_metrics(summary)
+    tracking.log_metrics({"failed_samples": errors})
+    tracking.set_tags({
+        "voiceink.winner": summary["winner"],
+        "voiceink.complete_440": str(summary["n_samples"] == 440).lower(),
+    })
+    tracking.log_artifact(summary_path, artifact_path="summaries")
+    references = [
+        output_reference("private_evaluation_details", detail_path, private=True),
+        output_reference("evaluation_summary", summary_path, private=False),
+    ]
+    if args.outputs:
+        references.append(output_reference(
+            "private_generation_input", args.outputs, private=True
+        ))
+    tracking.log_dict({"outputs": references}, "metadata/outputs.json")
+    tracking.finish()
 
 
 if __name__ == "__main__":

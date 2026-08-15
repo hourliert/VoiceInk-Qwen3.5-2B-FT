@@ -13,6 +13,7 @@ from src.training.finetune_lfm25 import (
     render_conversations,
 )
 from src.training.finetune_lfm25_12b_v3 import parse_args as parse_lfm_v3_args
+from src.training.finetune_lfm25_26b_v3 import parse_args as parse_lfm_26b_v3_args
 from src.training.finetune import (
     align_step_interval,
     compute_fused_eval_loss,
@@ -240,6 +241,24 @@ class LfmTrainerInputTests(unittest.TestCase):
         self.assertTrue(args.load_best_model_at_end)
         self.assertIn("lfm25-1.2b-voiceink-v3", str(args.output_dir))
         self.assertEqual(args.gguf_base.name, "LFM2.5-1.2B-VoiceInk-v3")
+
+    def test_lfm_26b_v3_profile_matches_locked_qwen_v3_recipe(self) -> None:
+        args = parse_lfm_26b_v3_args(["--check-only"])
+
+        self.assertEqual(args.base_model, "LiquidAI/LFM2.5-2.6B-Base")
+        self.assertEqual(str(args.train), "datasets/lfm25-v3/train.jsonl")
+        self.assertEqual(
+            str(args.eval), "datasets/lfm25-v3/eval-regression-340.jsonl"
+        )
+        self.assertEqual(args.epochs, 1)
+        self.assertEqual((args.r, args.lora_alpha), (32, 64))
+        self.assertEqual((args.batch_size, args.grad_accum), (4, 2))
+        self.assertEqual(args.batch_size * args.grad_accum, 8)
+        self.assertEqual(args.eval_batch_size, 4)
+        self.assertEqual(args.lr, 2e-4)
+        self.assertIn("lfm25-2.6b-voiceink-v3", str(args.output_dir))
+        self.assertEqual(args.gguf_base.name, "LFM2.5-2.6B-VoiceInk-v3")
+        self.assertTrue(args.check_only)
 
     def test_lfm_v3_conversion_only_changes_content_representation(self) -> None:
         source = convert_record(labeled_record(), "new prompt")

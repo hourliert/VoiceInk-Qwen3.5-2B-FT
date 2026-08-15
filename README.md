@@ -376,6 +376,41 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --export-gguf q4_k_m q8_0
 ```
 
+#### LFM2.5 2.6B VoiceInk V3 controlled rerun
+
+This profile uses the same locked 3,962-sample V3 training set and 340-sample
+training regression set as the Qwen3.5 V3 recipe. It runs one epoch with LoRA
+rank/alpha 32/64, an effective batch size of 8, completions-only loss, and an
+evaluation/checkpoint interval aligned to include the terminal optimizer step.
+
+```bash
+# Rebuild the deterministic LFM string conversion and validate the full recipe.
+.venv/bin/python3 src/training/prepare_lfm25_v3.py
+.venv/bin/python3 src/training/finetune_lfm25_26b_v3.py \
+  --check-only \
+  --load-best-model-at-end \
+  --export-gguf q4_k_m q8_0
+
+# One-step BF16 smoke test without the 340-row evaluation or export.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_v3.py \
+  --max-steps 1 \
+  --skip-eval \
+  --lora-dir training/lfm25-2.6b-voiceink-v3/smoke-lora \
+  --output-dir training/lfm25-2.6b-voiceink-v3/smoke-outputs
+
+# Full BF16 run, selecting the best checkpoint and exporting Q4_K_M and Q8_0.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_v3.py \
+  --load-best-model-at-end \
+  --export-gguf q4_k_m q8_0
+```
+
+If the BF16 smoke test runs out of memory, first retry it with
+`--batch-size 2 --grad-accum 4 --eval-batch-size 2`. This preserves the
+effective batch size. Add `--load-in-4bit` only if that smaller BF16 batch also
+does not fit.
+
 ### 6. Evaluation
 
 ```bash
@@ -426,6 +461,62 @@ python3 src/eval/evaluate.py \
   --outputs results/lfm25-generations.jsonl \
   --judge-provider codex --judge-model gpt-5.6-luna \
   --judge-reasoning-effort low --parallel 3
+```
+
+### 7. MLflow experiment tracking
+
+All Qwen/LFM SFT trainers, the Qwen DPO trainer, quality evaluation, and paired
+inference-speed benchmark log to the `voiceink-training`,
+`voiceink-evaluation`, or `voiceink-benchmarks` MLflow experiment by default.
+Training metrics are streamed live through the Transformers MLflow callback.
+The Model Training experience receives native metadata-only Dataset inputs and
+MLflow 3 Logged Models. Each Logged Model is linked to its training run, eval
+loss, and dataset fingerprint, while its LoRA/GGUF weights remain external and
+local. Live trainer metrics, CPU/RAM, and GPU utilization are recorded during
+training. Dataset manifests contain paths, row counts, byte sizes, and SHA-256
+fingerprints; private JSONL rows are never uploaded.
+
+Quality comparisons belong to the GenAI workflow: the non-private strict-v2
+Luna judge prompt is versioned in Prompt Registry and linked to each run, while
+aggregate scores and a safe summary are logged for comparison. GenAI tracing is
+deliberately disabled because automatic traces capture prompt inputs and model
+outputs; private transcripts, generated text, and per-sample judgments remain
+local as path/size/hash references. The MLflow UI's **GenAI / Model training**
+switch is a workspace view selector rather than a per-run setting.
+
+Install and start the LAN server:
+
+```bash
+.venv/bin/pip install 'mlflow>=3.15,<4'
+bin/start-mlflow.sh
+```
+
+The default UI is `http://192.168.1.150:5000`. Override the interface or CORS
+origin without editing the script:
+
+```bash
+MLFLOW_HOST=192.168.1.151 \
+MLFLOW_CORS_ALLOWED_ORIGINS=http://192.168.1.151:5000 \
+  bin/start-mlflow.sh
+```
+
+Every tracked CLI accepts `--mlflow-tracking-uri`, `--mlflow-experiment`,
+`--mlflow-run-name`, and `--mlflow-run-id` (to resume/enrich a run). Use
+`--no-mlflow` only for an intentional untracked run.
+The environment variable `MLFLOW_TRACKING_URI` overrides the repository's LAN
+default.
+
+Completed trainer states can be imported without rerunning training:
+
+```bash
+.venv/bin/python3 src/training/backfill_mlflow.py \
+  --training-output training/lfm25-2.6b-voiceink-v3/outputs \
+  --run-name LFM2.5-2.6B-VoiceInk-v3 \
+  --base-model LiquidAI/LFM2.5-2.6B-Base \
+  --train-data datasets/lfm25-v3/train.jsonl \
+  --eval-data datasets/lfm25-v3/eval-regression-340.jsonl \
+  --lora-dir training/lfm25-2.6b-voiceink-v3/lora \
+  --gguf-dir models/LFM2.5-2.6B-VoiceInk-v3_gguf
 ```
 
 #### Raw model speed screening

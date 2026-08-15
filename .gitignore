@@ -38,6 +38,8 @@ training/outputs/
 training/lfm25/
 training/lfm25-1.2b-voiceink-v3/
 training/lfm25-2.6b-base/
+training/lfm25-2.6b-voiceink-v3/
+training/mlflow/
 training/qwen35-2b-voiceink-v2/
 training/qwen35-2b-voiceink-v3/
 training/qwen35-08b-voiceink-v1/

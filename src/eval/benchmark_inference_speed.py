@@ -20,6 +20,12 @@ from eval.evaluate import (  # noqa: E402
     messages_for_layout,
     validate_eval_corpus,
 )
+from common.mlflow_tracking import (  # noqa: E402
+    add_mlflow_args,
+    dataset_metadata,
+    output_reference,
+    start_mlflow_run,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--output", type=Path)
+    add_mlflow_args(parser, default_experiment="voiceink-benchmarks")
     return parser.parse_args()
 
 
@@ -160,6 +167,28 @@ def main() -> None:
             f"--samples {args.samples} exceeds corpus size {len(samples)}"
         )
     indices = sorted(random.Random(args.seed).sample(range(len(samples)), args.samples))
+    tracking = start_mlflow_run(
+        args,
+        run_name=f"{args.candidate_model}-vs-{args.baseline_model}-speed",
+        run_kind="evaluation.inference_speed",
+        params={
+            "baseline_model": args.baseline_model,
+            "candidate_model": args.candidate_model,
+            "baseline_endpoint": f"{args.baseline_host}:{args.baseline_port}",
+            "candidate_endpoint": f"{args.candidate_host}:{args.candidate_port}",
+            "samples": args.samples,
+            "seed": args.seed,
+            "warmups": args.warmups,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "sample_indices": indices,
+        },
+        datasets=[dataset_metadata("speed_benchmark_eval", args.eval_data, len(samples))],
+        tags={
+            "voiceink.baseline_model": args.baseline_model,
+            "voiceink.candidate_model": args.candidate_model,
+        },
+    )
     endpoints = {
         "baseline": {
             "model": args.baseline_model,
@@ -215,6 +244,11 @@ def main() -> None:
         / summaries["candidate"]["avg_wall_ms"]
     )
     print(f"\nCandidate end-to-end speed ratio: {ratio:.2f}x")
+    tracking.log_metrics({
+        "baseline": summaries["baseline"],
+        "candidate": summaries["candidate"],
+        "candidate_speed_ratio": ratio,
+    })
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -234,6 +268,14 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"Saved metrics: {args.output}")
+        tracking.log_artifact(args.output, artifact_path="benchmarks")
+        tracking.log_dict(
+            {"outputs": [output_reference(
+                "speed_benchmark", args.output, private=False
+            )]},
+            "metadata/outputs.json",
+        )
+    tracking.finish()
 
 
 if __name__ == "__main__":
