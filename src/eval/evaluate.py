@@ -46,7 +46,7 @@ from training.prepare_dataset import (
     build_voiceink_user_message,
 )
 CANONICAL_EVAL = (
-    ROOT / "datasets" / "qwen35-2b-voiceink-v3" / "eval-all-440.jsonl"
+    ROOT / "datasets" / "regression" / "voiceink-locked-440.jsonl"
 )
 CANONICAL_EVAL_COUNT = 440
 CANONICAL_EVAL_SHA256 = (
@@ -57,6 +57,9 @@ DEFAULT_OUTPUT_DIR = ROOT / "results"
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "judge_prompt.txt"
 STRICT_V2_JUDGE_PROMPT_PATH = (
     Path(__file__).resolve().parent / "judge_prompt_strict_v2.txt"
+)
+STRICT_V3_JUDGE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "judge_prompt_strict_v3.txt"
 )
 
 WEIGHTS = {
@@ -119,7 +122,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     add_provider_args(p, prefix="judge")
     p.add_argument(
         "--judge-rubric",
-        choices=("legacy", "strict-v2"),
+        choices=("legacy", "strict-v2", "strict-v3"),
         default="legacy",
         help="Judge prompt/schema version (default: legacy)",
     )
@@ -527,7 +530,7 @@ def judge_one(
     for attempt in range(2):
         try:
             output_schema = CODEX_EVAL_JUDGE_SCHEMA
-            if judge_rubric == "strict-v2":
+            if judge_rubric in {"strict-v2", "strict-v3"}:
                 output_schema = CODEX_EVAL_JUDGE_STRICT_V2_SCHEMA
             raw = call_llm(
                 prompt,
@@ -545,7 +548,7 @@ def judge_one(
             raw,
             require_context_analysis=judge_provider == "codex",
             require_pairwise=(
-                judge_provider == "codex" and judge_rubric == "strict-v2"
+                judge_provider == "codex" and judge_rubric in {"strict-v2", "strict-v3"}
             ),
         )
         if parsed and "output_a" in parsed and "output_b" in parsed:
@@ -1001,9 +1004,9 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
 
 def main() -> None:
     args = parse_args()
-    if args.judge_rubric == "strict-v2" and args.judge_provider != "codex":
+    if args.judge_rubric in {"strict-v2", "strict-v3"} and args.judge_provider != "codex":
         print(
-            "--judge-rubric strict-v2 currently requires --judge-provider codex; "
+            "--judge-rubric strict-v2/strict-v3 requires --judge-provider codex; "
             "legacy Claude judging remains available",
             file=sys.stderr,
         )
@@ -1016,11 +1019,10 @@ def main() -> None:
     )
     judge_metadata["rubric"] = args.judge_rubric
     if not args.generate_only:
-        prompt_base = (
-            STRICT_V2_JUDGE_PROMPT_PATH
-            if args.judge_rubric == "strict-v2"
-            else JUDGE_PROMPT_PATH
-        )
+        prompt_base = {
+            "strict-v2": STRICT_V2_JUDGE_PROMPT_PATH,
+            "strict-v3": STRICT_V3_JUDGE_PROMPT_PATH,
+        }.get(args.judge_rubric, JUDGE_PROMPT_PATH)
         prompt_path = provider_prompt_path(prompt_base, args.judge_provider)
         if not prompt_path.is_file():
             print(f"Judge prompt not found: {prompt_path}", file=sys.stderr)

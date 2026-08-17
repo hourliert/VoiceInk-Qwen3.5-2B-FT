@@ -62,6 +62,8 @@ models/Qwen3.5-2B-VoiceInk-dpo-v1*/
 models/LFM2.5-1.2B-VoiceInk*/
 models/LFM2.5-2.6B-VoiceInk*/
 models/LFM2.5-8B-A1B-GGUF/
+models/Qwen3.8-2B/
+models/Qwen3.8-2B-VoiceInk-v1*/
 
 # Eval results
 results/
@@ -74,3 +76,20 @@ results/
 *~
 .DS_Store
 Thumbs.db
+
+# Private annotation registry, exports, and local backups
+datasets/registry/
+datasets/exports/
+
+# Canonical private releases and operational state
+datasets/regression/
+datasets/legacy/
+models/canonical/
+models/legacy/
+results/legacy/
+training/legacy/
+datasets/releases/
+training/canonical/
+training/backups/
+config/production-model.json
+/training/

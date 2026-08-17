@@ -6,6 +6,13 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
 
 **[Read the full blog post](docs/BLOG_POST.md)** for the complete story — from initial setup through five training iterations, a production bug caused by repetition amplification, and the synthetic data fix.
 
+> **Current workflow:** New data, training, evaluation, and promotion must use the
+> manifest-driven [canonical pipeline](docs/CANONICAL_PIPELINE.md). The older
+> commands below are retained as historical and low-level implementation references.
+> Historical datasets, checkpoints, VoiceInk models, and evals are isolated under
+> explicit `legacy/` namespaces; canonical artifacts live under `releases/` or
+> `canonical/` namespaces and are linked to MLflow by immutable fingerprints.
+
 ## How it works
 
 ```
@@ -44,7 +51,7 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
 - **Host machine**: Remote gaming PC (RTX 4080 Super, 16GB VRAM) running Linux, accessible from the Mac over the network.
 - **LLM backend**: [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-server`) on port 8002, serving multiple Qwen 3.5 model variants via an OpenAI-compatible API.
 - **Reverse proxy**: A lightweight Python proxy (`src/voiceink_proxy/server.py`) on port 8001 that forwards VoiceInk requests to llama-server and logs every request/response pair as JSONL for training data collection.
-- **Startup**: `bin/start.sh` launches both processes. A systemd unit (`systemd/llama-router.service`) runs it on boot.
+- **Startup**: `bin/start.sh` launches llama-server, the proxy, live review, and MLflow. A systemd unit (`systemd/llama-router.service`) runs the stack on boot.
 
 ## The fine-tuning pipeline
 
@@ -150,14 +157,14 @@ python3 src/labeling/review_server.py \
   --input datasets/labeled.jsonl \
   --input datasets/another-labeled-batch.jsonl \
   --mode suspicious \
-  --host 0.0.0.0 --port 8003
+  --host 0.0.0.0 --port 8004
 
 # Exact request IDs from a text or JSONL manifest
 python3 src/labeling/review_server.py \
   --input datasets/labeled.jsonl --ids-file datasets/review.jsonl
 ```
 
-Browse to `http://<machine-LAN-IP>:8003` when binding to `0.0.0.0`. The
+The production live-review site is started with the router at `http://192.168.1.150:8003`; see [the live-review guide](docs/LIVE_REVIEW.md). For the separate batch reviewer above, browse to `http://<machine-LAN-IP>:8004` when binding to `0.0.0.0`. The
 review server has no authentication, so expose it only on a trusted local
 network. Automatic approvals are stored as `auto_review`; only UI decisions
 are stored as `manual_review`. Approve and Save Edit make a record eligible
@@ -484,12 +491,23 @@ outputs; private transcripts, generated text, and per-sample judgments remain
 local as path/size/hash references. The MLflow UI's **GenAI / Model training**
 switch is a workspace view selector rather than a per-run setting.
 
-Install and start the LAN server:
+Install MLflow if needed. In normal operation `bin/start.sh` starts and
+supervises it automatically at `http://192.168.1.150:5000`:
 
 ```bash
 .venv/bin/pip install 'mlflow>=3.15,<4'
+```
+
+To start it immediately as a standalone process (for development or before
+restarting the router service), run:
+
+```bash
 bin/start-mlflow.sh
 ```
+
+`bin/start.sh` reuses an already healthy standalone instance instead of
+starting a duplicate. Set `MLFLOW_AUTOSTART=0` only when intentionally running
+MLflow separately.
 
 The default UI is `http://192.168.1.150:5000`. Override the interface or CORS
 origin without editing the script:

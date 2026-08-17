@@ -21,6 +21,7 @@ from src.training.finetune import (
     parse_args as parse_qwen_args,
 )
 from src.training.finetune_qwen35_08b import parse_args as parse_qwen_08b_args
+from src.training.finetune_qwen38_2b import parse_args as parse_qwen_38b_args
 from src.training.prepare_dataset import (
     content_text,
     convert_conversation_layout,
@@ -319,6 +320,39 @@ class QwenTrainerProfileTests(unittest.TestCase):
 
         self.assertEqual(total, 496)
         self.assertEqual(align_step_interval(total, args.eval_steps), 62)
+
+    def test_qwen38_profile_uses_local_distill_and_locked_440(self) -> None:
+        args = parse_qwen_38b_args(["--check-only"])
+
+        self.assertEqual(args.base_model, "models/Qwen3.8-2B")
+        self.assertEqual(
+            str(args.train), "datasets/qwen35-2b-voiceink-v3/train.jsonl"
+        )
+        self.assertEqual(
+            str(args.eval), "datasets/qwen35-2b-voiceink-v3/eval-all-440.jsonl"
+        )
+        self.assertEqual(args.epochs, 1)
+        self.assertEqual((args.r, args.lora_alpha), (32, 64))
+        self.assertEqual((args.batch_size, args.grad_accum), (4, 2))
+        self.assertEqual(args.eval_batch_size, 4)
+        self.assertEqual((args.eval_steps, args.save_steps), (62, 62))
+        self.assertTrue(args.load_best_model_at_end)
+        self.assertIn("qwen38-2b-voiceink-v1", str(args.output_dir))
+        self.assertEqual(args.gguf_base.name, "Qwen3.8-2B-VoiceInk-v1")
+        self.assertEqual(args.mlflow_run_name, "qwen38-2b-voiceink-v1-sft")
+
+    def test_qwen38_profile_allows_isolated_smoke_overrides(self) -> None:
+        args = parse_qwen_38b_args([
+            "--max-steps", "1",
+            "--eval-steps", "1",
+            "--save-steps", "1",
+            "--lora-dir", "training/qwen38-2b-voiceink-v1/smoke-lora",
+            "--output-dir", "training/qwen38-2b-voiceink-v1/smoke-outputs",
+        ])
+
+        self.assertEqual(args.max_steps, 1)
+        self.assertIn("smoke-lora", str(args.lora_dir))
+        self.assertIn("smoke-outputs", str(args.output_dir))
 
     def test_eval_interval_is_unchanged_when_terminal_step_already_aligns(self) -> None:
         self.assertEqual(align_step_interval(500, 50), 50)

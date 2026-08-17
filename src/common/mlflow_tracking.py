@@ -415,6 +415,24 @@ def start_mlflow_run(
         **_git_metadata(),
         **(tags or {}),
     }
+    lineage_environment = {
+        "voiceink.dataset_release": os.environ.get("VOICEINK_DATASET_RELEASE", ""),
+        "voiceink.dataset_release_sha256": os.environ.get(
+            "VOICEINK_DATASET_RELEASE_SHA256", ""
+        ),
+        "voiceink.dataset_manifest": os.environ.get("VOICEINK_DATASET_MANIFEST", ""),
+        "voiceink.dataset_manifest_sha256": os.environ.get(
+            "VOICEINK_DATASET_MANIFEST_SHA256", ""
+        ),
+        "voiceink.training_profile": os.environ.get("VOICEINK_TRAINING_PROFILE", ""),
+        "voiceink.training_profile_path": os.environ.get(
+            "VOICEINK_TRAINING_PROFILE_PATH", ""
+        ),
+        "voiceink.training_profile_sha256": os.environ.get(
+            "VOICEINK_TRAINING_PROFILE_SHA256", ""
+        ),
+    }
+    run_tags.update({key: value for key, value in lineage_environment.items() if value})
     if resumed_changes:
         run_tags["voiceink.resumed_param_changes"] = json.dumps(
             resumed_changes, sort_keys=True
@@ -427,6 +445,14 @@ def start_mlflow_run(
         },
         "metadata/datasets.json",
     )
+    safe_lineage_artifacts = {
+        "dataset-release": os.environ.get("VOICEINK_DATASET_MANIFEST", ""),
+        "training-profile": os.environ.get("VOICEINK_TRAINING_PROFILE_PATH", ""),
+    }
+    for artifact_name, artifact_value in safe_lineage_artifacts.items():
+        artifact = Path(artifact_value) if artifact_value else None
+        if artifact and artifact.is_file():
+            handle.log_artifact(artifact, artifact_path=f"lineage/{artifact_name}")
     print(
         f"MLflow: {args.mlflow_experiment}/{resolved_name} "
         f"({run.info.run_id}) -> {args.mlflow_tracking_uri}"

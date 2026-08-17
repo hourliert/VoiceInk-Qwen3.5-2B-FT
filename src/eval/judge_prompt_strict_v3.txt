@@ -1,0 +1,2 @@
+Strict-v3 is supported through the Codex judge provider only. Use the
+provider-specific .codex.txt prompt.
