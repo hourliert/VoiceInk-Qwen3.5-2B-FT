@@ -815,6 +815,48 @@ def determine_winner(b_avg, c_avg, b_dims, c_dims):
         return "baseline", f"Baseline wins {b_avg} vs {c_avg} (+{round(b_avg - c_avg, 1)})"
 
 
+def _model_metrics(summary: dict, role: str) -> dict:
+    """Project paired results onto identical MLflow metric names per model."""
+    metrics = {
+        "samples": summary.get("n_samples", summary.get("samples", 0)),
+        "latency": summary.get(f"{role}_latency", {}),
+    }
+    if "per_dimension" in summary:
+        metrics["quality"] = {
+            dimension: values.get(f"{role}_avg")
+            for dimension, values in summary["per_dimension"].items()
+        }
+        metrics["quality"]["overall"] = summary.get(f"{role}_avg_score")
+        wins = summary.get("wins", {})
+        metrics["pairwise_wins"] = wins.get(role, 0)
+        material = summary.get("judge_pairwise", {}).get("material_wins", {})
+        metrics["material_wins"] = material.get(role, 0)
+    return metrics
+
+
+def log_mlflow_comparison(tracking, args, summary: dict) -> None:
+    """Attach comparable metrics to two distinct MLflow Logged Models."""
+    model_ids = {}
+    for role in ("baseline", "candidate"):
+        model_name = getattr(args, role)
+        model_ids[role] = tracking.log_external_model(
+            name=model_name,
+            model_type="voiceink-transcript-cleanup",
+            params={
+                "comparison_role": role,
+                "temperature": getattr(args, f"{role}_temperature"),
+                "message_layout": getattr(args, f"{role}_message_layout"),
+            },
+            tags={"voiceink.comparison_role": role},
+            metrics=_model_metrics(summary, role),
+            dataset_role="full_quality_eval",
+        )
+    tracking.set_tags({
+        f"voiceink.{role}_logged_model_id": model_id
+        for role, model_id in model_ids.items() if model_id
+    })
+
+
 # ---- Output ----
 
 def _fmt_p(p: float | None) -> str:
@@ -1239,7 +1281,7 @@ def main() -> None:
         )
 
     if args.generate_only:
-        tracking.log_metrics({
+        generation_summary = {
             "samples": len(samples),
             "baseline_latency": _latency_stats(sorted(
                 output["duration_ms"] for output in baseline_outputs
@@ -1249,7 +1291,9 @@ def main() -> None:
                 output["duration_ms"] for output in candidate_outputs
                 if output and output.get("duration_ms")
             )),
-        })
+        }
+        tracking.log_metrics(generation_summary)
+        log_mlflow_comparison(tracking, args, generation_summary)
         if generation_path is not None:
             tracking.log_dict(
                 {"outputs": [output_reference(
@@ -1344,6 +1388,7 @@ def main() -> None:
         filtered_candidate, filtered_judgments, summary, judge_metadata,
     )
     tracking.log_metrics(summary)
+    log_mlflow_comparison(tracking, args, summary)
     tracking.log_metrics({"failed_samples": errors})
     tracking.set_tags({
         "voiceink.winner": summary["winner"],

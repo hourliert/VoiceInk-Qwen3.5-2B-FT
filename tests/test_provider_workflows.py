@@ -11,6 +11,7 @@ from src.eval.evaluate import (
     CANONICAL_EVAL_COUNT,
     DEFAULT_EVAL,
     aggregate,
+    _model_metrics,
     load_eval_data,
     load_saved_outputs,
     message_text,
@@ -313,6 +314,31 @@ class ProviderWorkflowTests(unittest.TestCase):
         self.assertEqual(outputs["baseline"]["text"], "Baseline")
         self.assertEqual(outputs["candidate"]["duration_ms"], 5)
         self.assertIs(outputs, saved_outputs[0])
+
+    def test_mlflow_model_metrics_use_shared_names_for_both_models(self) -> None:
+        summary = {
+            "n_samples": 440,
+            "baseline_avg_score": 95.2,
+            "candidate_avg_score": 95.3,
+            "baseline_latency": {"avg": 770, "p50": 268},
+            "candidate_latency": {"avg": 760, "p50": 268},
+            "per_dimension": {
+                "meaning_preservation": {
+                    "baseline_avg": 4.60, "candidate_avg": 4.59,
+                },
+            },
+            "wins": {"baseline": 90, "candidate": 95},
+            "judge_pairwise": {"material_wins": {"baseline": 62, "candidate": 71}},
+        }
+
+        baseline = _model_metrics(summary, "baseline")
+        candidate = _model_metrics(summary, "candidate")
+
+        self.assertEqual(set(baseline), set(candidate))
+        self.assertEqual(baseline["quality"]["meaning_preservation"], 4.60)
+        self.assertEqual(candidate["quality"]["meaning_preservation"], 4.59)
+        self.assertEqual(baseline["latency"]["avg"], 770)
+        self.assertEqual(candidate["latency"]["avg"], 760)
 
     def test_reference_loader_keeps_human_label_metadata(self) -> None:
         path = self.write_jsonl([{
