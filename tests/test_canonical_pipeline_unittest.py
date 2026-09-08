@@ -252,6 +252,10 @@ class CanonicalPipelineTests(unittest.TestCase):
         self.assertEqual(qwen_sft["grad_accum"], 8)
         self.assertEqual(qwen_sft["eval_batch_size"], 1)
         self.assertEqual(qwen_sft["batch_size"] * qwen_sft["grad_accum"], 8)
+        minicpm = profiles["minicpm5-2b-sft"]
+        self.assertEqual(minicpm["trainer"], "minicpm")
+        self.assertEqual(minicpm["base_model"], "openbmb/MiniCPM5-2B")
+        self.assertEqual(minicpm["batch_size"] * minicpm["grad_accum"], 8)
 
     def test_legacy_layout_is_explicit_and_non_destructive_by_default(self):
         with tempfile.TemporaryDirectory() as directory:

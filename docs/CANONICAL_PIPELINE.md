@@ -105,6 +105,29 @@ Dependencies are pinned by `pyproject.toml` and `uv.lock`. After the current
 GPU job has finished, synchronize once with `uv sync`; `nvidia-ml-py` enables
 MLflow GPU telemetry on future runs.
 
+### MiniCPM5 2B candidate
+
+MiniCPM5 uses the same sealed release and MLflow lineage contract, but a dedicated
+text-only trainer and isolated canonical output namespace. Thinking is disabled in
+the training chat template, and LoRA targets the standard attention and MLP
+projections recommended by the upstream Unsloth recipe. Start with one epoch; do
+not tune a second epoch until the first candidate has passed the engineering suite.
+
+```bash
+.venv/bin/python3 src/training/train.py sft \
+  --profile minicpm5-2b-sft \
+  --release-manifest datasets/releases/<release>/manifest.json \
+  --version <release> \
+  --export-gguf q4_k_m \
+  --check-only
+```
+
+Remove `--check-only` for the full run. The Q4_K_M export is the production
+candidate; retain the merged Hugging Face model and LoRA adapter for reproducibility.
+The model config, tokenizer, ChatML rendering, and 131K context declaration have
+been validated under the pinned project environment. Run a short GPU smoke test
+before the full job; do not mutate the established Qwen environment preemptively.
+
 ### Preference tuning
 
 DPO uses the same fail-closed contract. First seal reviewed pairs as a

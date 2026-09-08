@@ -38,7 +38,7 @@ def resolved_command(args: argparse.Namespace) -> tuple[list[str], dict]:
     if args.mode == "dpo":
         representation = "preference"
     else:
-        representation = "text" if profile["trainer"] == "lfm" else "text-blocks"
+        representation = "text" if profile["trainer"] in ("lfm", "minicpm") else "text-blocks"
     train = split_path(
         args.release_manifest, manifest, "train", representation=representation
     )
@@ -63,7 +63,11 @@ def resolved_command(args: argparse.Namespace) -> tuple[list[str], dict]:
         "--mlflow-run-name", f"{args.profile}-{version}",
     ]
     if args.mode == "sft":
-        script = "finetune.py" if profile["trainer"] == "qwen" else "finetune_lfm25.py"
+        scripts = {"qwen": "finetune.py", "lfm": "finetune_lfm25.py", "minicpm": "finetune_minicpm5.py"}
+        try:
+            script = scripts[profile["trainer"]]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported SFT trainer: {profile['trainer']!r}") from exc
         command = [sys.executable, str(ROOT / "src" / "training" / script), *common,
                    "--eval-batch-size", str(profile["eval_batch_size"]),
                    "--warmup-steps", str(profile["warmup_steps"]),

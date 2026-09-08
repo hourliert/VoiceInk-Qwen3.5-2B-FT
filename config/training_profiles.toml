@@ -54,6 +54,25 @@ save_steps = 50
 output_root = "training/canonical/lfm25-26b"
 model_root = "models/canonical/LFM2.5-2.6B-VoiceInk"
 
+[profiles.minicpm5-2b-sft]
+mode = "sft"
+trainer = "minicpm"
+base_model = "openbmb/MiniCPM5-2B"
+max_seq_length = 16384
+lora_r = 16
+lora_alpha = 32
+# Conservative per-device batching for variable-length 16K rows on 16 GB VRAM.
+batch_size = 1
+grad_accum = 8
+eval_batch_size = 1
+epochs = 1
+learning_rate = 0.0002
+warmup_steps = 10
+eval_steps = 50
+save_steps = 50
+output_root = "training/canonical/minicpm5-2b"
+model_root = "models/canonical/MiniCPM5-2B-VoiceInk"
+
 [profiles.qwen35-2b-dpo]
 mode = "dpo"
 trainer = "qwen-dpo"

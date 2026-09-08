@@ -14,6 +14,12 @@ from src.training.finetune_lfm25 import (
 )
 from src.training.finetune_lfm25_12b_v3 import parse_args as parse_lfm_v3_args
 from src.training.finetune_lfm25_26b_v3 import parse_args as parse_lfm_26b_v3_args
+from src.training.finetune_minicpm5 import (
+    LORA_TARGET_MODULES as MINICPM_LORA_TARGETS,
+    MINICPM5_2B_PROFILE,
+    parse_args as parse_minicpm_args,
+    render_conversations as render_minicpm_conversations,
+)
 from src.training.finetune import (
     align_step_interval,
     compute_fused_eval_loss,
@@ -210,6 +216,31 @@ class LfmTrainerInputTests(unittest.TestCase):
 
         self.assertEqual(rendered, [{"text": "rendered chat"}])
         self.assertEqual(tokenizer.call, (record["messages"], False, False))
+
+    def test_minicpm5_profile_and_chat_template_are_explicit(self) -> None:
+        args = parse_minicpm_args(MINICPM5_2B_PROFILE, [])
+
+        self.assertEqual(args.base_model, "openbmb/MiniCPM5-2B")
+        self.assertEqual((args.r, args.lora_alpha), (16, 32))
+        self.assertEqual(args.epochs, 1)
+        self.assertEqual(args.lr, 2e-4)
+        self.assertEqual(MINICPM_LORA_TARGETS, [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ])
+
+        record = convert_record(labeled_record(), "new prompt", "string")
+
+        class Tokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                self.call = (messages, kwargs)
+                return "rendered chat"
+
+        tokenizer = Tokenizer()
+        rendered = render_minicpm_conversations([record], tokenizer)
+        self.assertEqual(rendered, [{"text": "rendered chat"}])
+        self.assertFalse(tokenizer.call[1]["enable_thinking"])
+        self.assertFalse(tokenizer.call[1]["add_generation_prompt"])
 
     def test_12b_profile_preserves_existing_defaults(self) -> None:
         args = parse_args(LFM25_12B_PROFILE, [])
