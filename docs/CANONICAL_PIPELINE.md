@@ -114,23 +114,26 @@ into preference training.
 
 ## Evaluation and promotion
 
-Run the complete gate:
+Start with the release's sealed 150-sample acceptance split:
 
 ```bash
-.venv/bin/python3 src/eval/strict.py run \
+.venv/bin/python3 src/eval/run.py \
   --baseline VoiceInk-Production \
   --candidate Qwen3.8-2B-VoiceInk-v2 \
   --release-manifest datasets/releases/voiceink-data-v1/manifest.json \
-  --judge-model gpt-5.6-luna \
-  --judge-reasoning-effort low \
-  --parallel 3
+  --parallel 10
 ```
 
-It must finish 440/440 historical strict-v2 judgments and 150/150 sealed
-strict-v3 judgments. Any judge failure makes the command non-promotable. The
-promotion report enforces protected-dimension significance, overall and
-dimension margins, and p50/p90 latency limits across both corpora, plus zero
-critical acceptance failures and full release reproducibility.
+The release-aware entry point resolves the acceptance file, expected count,
+strict-v3 rubric, and Codex/Luna provider. It does not run the historical 440.
+
+Once a candidate is promising, add `--include-regression` to the same command
+for the final promotion gate. That opt-in run adds the locked 440-sample
+strict-v2 regression suite and produces complete promotion evidence. Any judge
+failure makes the final command non-promotable. The promotion report enforces
+protected-dimension significance, overall and dimension margins, and p50/p90
+latency limits across both corpora, plus zero critical acceptance failures and
+full release reproducibility.
 
 Only a passing report can be promoted:
 

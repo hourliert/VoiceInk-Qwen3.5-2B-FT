@@ -218,6 +218,11 @@ class CanonicalPipelineTests(unittest.TestCase):
             profiles["qwen35-2b-dpo"]["base_model"],
             "models/canonical/Qwen3.5-2B-VoiceInk-v3",
         )
+        qwen_sft = profiles["qwen35-2b-sft"]
+        self.assertEqual(qwen_sft["batch_size"], 1)
+        self.assertEqual(qwen_sft["grad_accum"], 8)
+        self.assertEqual(qwen_sft["eval_batch_size"], 1)
+        self.assertEqual(qwen_sft["batch_size"] * qwen_sft["grad_accum"], 8)
 
     def test_legacy_layout_is_explicit_and_non_destructive_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
