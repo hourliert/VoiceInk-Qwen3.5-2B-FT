@@ -74,6 +74,9 @@ ui/node_modules/
 ui/test-results/
 src/control_plane/static/
 
+# Downloaded upstream model snapshots
+/models/MiniCPM5-2B/
+
 # Local tool and model metadata caches
 /.cache/
 

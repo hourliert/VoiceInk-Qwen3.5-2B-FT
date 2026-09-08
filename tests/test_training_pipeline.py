@@ -220,7 +220,7 @@ class LfmTrainerInputTests(unittest.TestCase):
     def test_minicpm5_profile_and_chat_template_are_explicit(self) -> None:
         args = parse_minicpm_args(MINICPM5_2B_PROFILE, [])
 
-        self.assertEqual(args.base_model, "openbmb/MiniCPM5-2B")
+        self.assertEqual(args.base_model, str(Path(__file__).resolve().parents[1] / "models" / "MiniCPM5-2B"))
         self.assertEqual((args.r, args.lora_alpha), (16, 32))
         self.assertEqual(args.epochs, 1)
         self.assertEqual(args.lr, 2e-4)

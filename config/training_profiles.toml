@@ -57,7 +57,7 @@ model_root = "models/canonical/LFM2.5-2.6B-VoiceInk"
 [profiles.minicpm5-2b-sft]
 mode = "sft"
 trainer = "minicpm"
-base_model = "openbmb/MiniCPM5-2B"
+base_model = "models/MiniCPM5-2B"
 max_seq_length = 16384
 lora_r = 16
 lora_alpha = 32

@@ -33,7 +33,7 @@ DEFAULT_EVAL = ROOT / "datasets" / "releases" / "voiceink-data-v1" / "validation
 DEFAULT_LORA_DIR = ROOT / "training" / "minicpm5-2b" / "lora"
 DEFAULT_OUTPUT_DIR = ROOT / "training" / "minicpm5-2b" / "outputs"
 DEFAULT_GGUF_BASE = ROOT / "models" / "MiniCPM5-2B-VoiceInk"
-DEFAULT_MODEL = "openbmb/MiniCPM5-2B"
+DEFAULT_MODEL = str(ROOT / "models" / "MiniCPM5-2B")
 LORA_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
