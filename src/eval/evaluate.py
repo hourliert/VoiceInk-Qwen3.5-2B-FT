@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Evaluate baseline vs candidate model on transcription cleanup quality.
 
-Runs both models on the eval dataset, has Claude Sonnet 4.6 judge each pair
-blindly, and aggregates scores to determine a winner.
+Runs both models on the eval dataset, has a configured LLM judge each pair
+blindly, and aggregates scores to determine a winner. Generation artifacts can
+be saved and judged separately so inference never needs to be repeated.
 
 Usage:
     python3 src/eval/evaluate.py --baseline Qwen3.5-4B --candidate Qwen3.5-2B-VoiceInk
@@ -10,22 +11,56 @@ Usage:
 """
 import argparse
 import datetime
+import hashlib
 import http.client
 import json
-import os
 import random
-import re
-import subprocess
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-DEFAULT_EVAL = ROOT / "datasets" / "eval.jsonl"
+from common.llm_cli import (
+    CODEX_EVAL_JUDGE_SCHEMA,
+    CODEX_EVAL_JUDGE_STRICT_V2_SCHEMA,
+    SCORE_DIMENSIONS,
+    add_provider_args,
+    call_llm,
+    parse_json_response,
+    provider_metadata,
+    provider_prompt_path,
+    resolve_model,
+)
+from common.mlflow_tracking import (  # noqa: E402
+    add_mlflow_args,
+    dataset_metadata,
+    output_reference,
+    start_mlflow_run,
+)
+from training.prepare_dataset import (
+    build_user_message,
+    build_voiceink_system_message,
+    build_voiceink_user_message,
+)
+CANONICAL_EVAL = (
+    ROOT / "datasets" / "regression" / "voiceink-locked-440.jsonl"
+)
+CANONICAL_EVAL_COUNT = 440
+CANONICAL_EVAL_SHA256 = (
+    "0f08d1eb8788c716f265f2ec90d6495f7901d2dfe91d605dba130ef04db980f5"
+)
+DEFAULT_EVAL = CANONICAL_EVAL
 DEFAULT_OUTPUT_DIR = ROOT / "results"
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "judge_prompt.txt"
+STRICT_V2_JUDGE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "judge_prompt_strict_v2.txt"
+)
+STRICT_V3_JUDGE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "judge_prompt_strict_v3.txt"
+)
 
 WEIGHTS = {
     "meaning_preservation": 3,
@@ -39,68 +74,229 @@ TOTAL_WEIGHT = sum(WEIGHTS.values())  # 13
 MAX_SCORE = 5
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate baseline vs candidate model.")
     p.add_argument("--baseline", required=True,
                    help="Baseline model alias on llama-server (e.g., Qwen3.5-4B)")
     p.add_argument("--candidate", required=True,
                    help="Candidate model alias on llama-server (e.g., Qwen3.5-2B-VoiceInk)")
     p.add_argument("--eval-data", type=Path, default=DEFAULT_EVAL,
-                   help=f"Eval dataset JSONL (default: {DEFAULT_EVAL})")
+                   help=f"Eval dataset JSONL (default: canonical 440 at {DEFAULT_EVAL})")
+    p.add_argument(
+        "--allow-noncanonical-eval",
+        action="store_true",
+        help="Explicitly allow a full evaluation corpus other than canonical V3 440",
+    )
     p.add_argument("--llama-host", default="127.0.0.1")
     p.add_argument("--llama-port", type=int, default=8002)
-    p.add_argument("--judge-model", default="claude-sonnet-4-6")
+    p.add_argument(
+        "--baseline-temperature",
+        type=float,
+        default=0.3,
+        help="Sampling temperature for baseline inference (default: 0.3)",
+    )
+    p.add_argument(
+        "--candidate-temperature",
+        type=float,
+        default=0.3,
+        help="Sampling temperature for candidate inference (default: 0.3)",
+    )
+    p.add_argument(
+        "--inference-seed",
+        type=int,
+        default=None,
+        help="Optional shared llama.cpp sampling seed for reproducible paired inference",
+    )
+    p.add_argument(
+        "--baseline-message-layout",
+        choices=("prepared", "voiceink"),
+        default="voiceink",
+        help="Message layout for baseline inference (default: voiceink production layout)",
+    )
+    p.add_argument(
+        "--candidate-message-layout",
+        choices=("prepared", "voiceink"),
+        default="voiceink",
+        help="Message layout for candidate inference (default: voiceink production layout)",
+    )
+    add_provider_args(p, prefix="judge")
+    p.add_argument(
+        "--judge-rubric",
+        choices=("legacy", "strict-v2", "strict-v3"),
+        default="legacy",
+        help="Judge prompt/schema version (default: legacy)",
+    )
     p.add_argument("--parallel", type=int, default=3,
                    help="Parallel judge calls")
     p.add_argument("--limit", type=int, default=0,
                    help="Max samples to evaluate (0 = all)")
+    p.add_argument(
+        "--sample-indices",
+        default=None,
+        help="Comma-separated zero-based eval indices; cannot be combined with --limit",
+    )
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for A/B assignment")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--resume", type=Path, default=None,
                    help="Resume from a previous eval JSONL (skips already-judged samples)")
+    p.add_argument("--outputs", type=Path, default=None,
+                   help="Judge saved generation/eval JSONL without running local inference")
+    p.add_argument("--generation-output", type=Path, default=None,
+                   help="Path for generated model outputs (default: timestamped in output dir)")
+    p.add_argument("--generate-only", action="store_true",
+                   help="Generate and save model outputs, then exit before judging")
     p.add_argument("--dry-run", action="store_true",
-                   help="Print judge prompts without calling Claude")
-    return p.parse_args()
+                   help="Print judge prompts without calling the configured provider")
+    add_mlflow_args(p, default_experiment="voiceink-evaluation")
+    return p.parse_args(argv)
 
 
 # ---- Data loading ----
+
+def message_text(content) -> str:
+    """Extract text from either text-only or VLM message content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    raise ValueError(f"Unsupported message content type: {type(content).__name__}")
+
+
+def extract_last_tag_content(text: str, tag: str) -> str | None:
+    """Extract the last complete tag pair, ignoring examples in earlier context."""
+    opening = f"<{tag}>"
+    closing = f"</{tag}>"
+    close_index = text.rfind(closing)
+    if close_index < 0:
+        return None
+    open_index = text.rfind(opening, 0, close_index)
+    if open_index < 0:
+        return None
+    return text[open_index + len(opening):close_index].strip()
+
+
+def unwrap_voiceink_system(text: str) -> tuple[str, str]:
+    """Return canonical instructions and dynamic context from a system message."""
+    stripped = text.strip()
+    opening = "<SYSTEM_INSTRUCTIONS>"
+    closing = "</SYSTEM_INSTRUCTIONS>"
+    if not stripped.startswith(opening):
+        return stripped, ""
+    close_index = stripped.find(closing)
+    if close_index < len(opening):
+        raise ValueError("Unclosed SYSTEM_INSTRUCTIONS wrapper in eval data")
+    instructions = stripped[len(opening):close_index].strip()
+    return instructions, stripped[close_index + len(closing):]
+
 
 def load_eval_data(path: Path) -> list[dict]:
     """Load eval.jsonl and extract messages + gold label."""
     samples = []
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for sample_index, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
             record = json.loads(line)
             msgs = record["messages"]
 
-            # Extract plain text from VLM typed content blocks
-            system_text = msgs[0]["content"][0]["text"]
-            user_text = msgs[1]["content"][0]["text"]
-            gold_label = msgs[2]["content"][0]["text"]
+            stored_system_text = message_text(msgs[0]["content"])
+            user_text = message_text(msgs[1]["content"])
+            gold_label = message_text(msgs[2]["content"])
+
+            system_text, context_text = unwrap_voiceink_system(stored_system_text)
+            stripped_user = user_text.strip()
+            stored_message_layout = (
+                "voiceink"
+                if (
+                    stored_system_text.strip().startswith("<SYSTEM_INSTRUCTIONS>")
+                    and stripped_user.startswith("<TRANSCRIPT>")
+                    and stripped_user.endswith("</TRANSCRIPT>")
+                )
+                else "prepared"
+            )
 
             # Extract raw transcript and vocabulary from user message
-            m = re.search(r"<TRANSCRIPT>\s*(.*?)\s*</TRANSCRIPT>", user_text, re.DOTALL)
-            raw_transcript = m.group(1).strip() if m else user_text.strip()
+            if (
+                stripped_user.startswith("<TRANSCRIPT>")
+                and stripped_user.endswith("</TRANSCRIPT>")
+            ):
+                transcript = stripped_user[
+                    len("<TRANSCRIPT>"):-len("</TRANSCRIPT>")
+                ].strip()
+            else:
+                transcript = extract_last_tag_content(user_text, "TRANSCRIPT")
+            raw_transcript = transcript if transcript is not None else user_text.strip()
 
-            v = re.search(r"<CUSTOM_VOCABULARY>\s*(.*?)\s*</CUSTOM_VOCABULARY>", user_text, re.DOTALL)
-            custom_vocabulary = v.group(1).strip() if v else ""
+            vocabulary = (
+                extract_last_tag_content(user_text, "CUSTOM_VOCABULARY")
+                or extract_last_tag_content(context_text, "CUSTOM_VOCABULARY")
+            )
+            custom_vocabulary = vocabulary if vocabulary is not None else ""
+
+            window = (
+                extract_last_tag_content(user_text, "CURRENT_WINDOW_CONTEXT")
+                or extract_last_tag_content(context_text, "CURRENT_WINDOW_CONTEXT")
+            )
+            window_context = window if window is not None else ""
+
+            clipboard = (
+                extract_last_tag_content(user_text, "CLIPBOARD_CONTEXT")
+                or extract_last_tag_content(context_text, "CLIPBOARD_CONTEXT")
+            )
+            clipboard_context = clipboard if clipboard is not None else ""
 
             samples.append({
+                "sample_index": sample_index,
                 "system_text": system_text,
                 "user_text": user_text,
                 "gold_label": gold_label,
                 "raw_transcript": raw_transcript,
                 "custom_vocabulary": custom_vocabulary,
-                "messages_for_llama": [
-                    {"role": "system", "content": system_text},
-                    {"role": "user", "content": user_text},
-                ],
+                "window_context": window_context,
+                "clipboard_context": clipboard_context,
+                "stored_system_text": stored_system_text,
+                "stored_user_text": user_text,
+                "stored_message_layout": stored_message_layout,
             })
     return samples
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_eval_corpus(
+    path: Path, sample_count: int, allow_noncanonical: bool = False
+) -> None:
+    """Fail closed unless a full benchmark uses the locked V3 440 corpus."""
+    if allow_noncanonical:
+        return
+    if path.resolve() != CANONICAL_EVAL.resolve():
+        raise ValueError(
+            f"Full evaluations require canonical {CANONICAL_EVAL_COUNT}-sample "
+            f"corpus {CANONICAL_EVAL}; pass --allow-noncanonical-eval to override"
+        )
+    if sample_count != CANONICAL_EVAL_COUNT:
+        raise ValueError(
+            f"Canonical evaluation must contain {CANONICAL_EVAL_COUNT} samples; "
+            f"found {sample_count}"
+        )
+    actual_hash = sha256_file(path)
+    if actual_hash != CANONICAL_EVAL_SHA256:
+        raise ValueError(
+            "Canonical evaluation fingerprint mismatch: "
+            f"expected {CANONICAL_EVAL_SHA256}, found {actual_hash}"
+        )
 
 
 def load_cached_results(path: Path) -> dict[str, dict]:
@@ -118,16 +314,96 @@ def load_cached_results(path: Path) -> dict[str, dict]:
     return cache
 
 
+def select_sample_indices(samples: list[dict], specification: str) -> list[dict]:
+    """Select unique zero-based samples in the caller-provided order."""
+    try:
+        indices = [int(value.strip()) for value in specification.split(",")]
+    except ValueError as exc:
+        raise ValueError("--sample-indices must contain only integers") from exc
+    if not indices or any(not value.strip() for value in specification.split(",")):
+        raise ValueError("--sample-indices cannot contain empty values")
+    if len(indices) != len(set(indices)):
+        raise ValueError("--sample-indices cannot contain duplicates")
+    invalid = [index for index in indices if not 0 <= index < len(samples)]
+    if invalid:
+        raise ValueError(
+            f"--sample-indices out of range for {len(samples)} samples: {invalid}"
+        )
+    return [samples[index] for index in indices]
+
+
+def load_saved_outputs(path: Path) -> dict[str | int, dict]:
+    """Load generated outputs from either a generation or completed eval JSONL."""
+    outputs = {}
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            key = record.get("raw_transcript", "")
+            if not key or "baseline_output" not in record or "candidate_output" not in record:
+                continue
+            output = {
+                "baseline": {
+                    "text": record["baseline_output"],
+                    "duration_ms": record.get("baseline_duration_ms", 0),
+                },
+                "candidate": {
+                    "text": record["candidate_output"],
+                    "duration_ms": record.get("candidate_duration_ms", 0),
+                },
+            }
+            outputs[key] = output
+            sample_index = record.get("sample_index")
+            if isinstance(sample_index, int):
+                outputs[sample_index] = output
+    return outputs
+
+
 # ---- Model inference ----
 
-def query_llama(messages: list[dict], model: str, host: str, port: int) -> tuple[str, float]:
+def messages_for_layout(sample: dict, layout: str) -> list[dict]:
+    """Build model messages using prepared-dataset or live VoiceInk placement."""
+    if layout == sample.get("stored_message_layout"):
+        return [
+            {"role": "system", "content": sample["stored_system_text"]},
+            {"role": "user", "content": sample["stored_user_text"]},
+        ]
+    components = {
+        "window_context": sample["window_context"],
+        "clipboard_context": sample["clipboard_context"],
+        "custom_vocabulary": sample["custom_vocabulary"],
+        "transcript": sample["raw_transcript"],
+    }
+    if layout == "prepared":
+        system_text = sample["system_text"]
+        user_text = build_user_message(components)
+    elif layout == "voiceink":
+        system_text = build_voiceink_system_message(
+            components, sample["system_text"]
+        )
+        user_text = build_voiceink_user_message(components)
+    else:
+        raise ValueError(f"Unsupported message layout: {layout}")
+    return [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def query_llama(messages: list[dict], model: str, host: str, port: int,
+                temperature: float = 0.3,
+                seed: int | None = None) -> tuple[str, float]:
     """Send a chat completion request. Returns (response_text, duration_ms)."""
-    payload = json.dumps({
+    request = {
         "model": model,
         "messages": messages,
         "stream": False,
-        "temperature": 0.3,
-    }).encode("utf-8")
+        "temperature": temperature,
+    }
+    if seed is not None:
+        request["seed"] = seed
+    payload = json.dumps(request).encode("utf-8")
 
     start = time.monotonic()
     conn = http.client.HTTPConnection(host, port, timeout=300)
@@ -144,13 +420,19 @@ def query_llama(messages: list[dict], model: str, host: str, port: int) -> tuple
     return text, duration_ms
 
 
-def generate_outputs(samples: list[dict], model: str, host: str, port: int) -> list[dict]:
+def generate_outputs(samples: list[dict], model: str, host: str, port: int,
+                     temperature: float = 0.3,
+                     seed: int | None = None,
+                     message_layout: str = "voiceink") -> list[dict]:
     """Run a model on all eval samples sequentially."""
     results = []
     for i, sample in enumerate(samples, 1):
         print(f"  [{i}/{len(samples)}] {model}...", end=" ", flush=True)
         try:
-            text, duration_ms = query_llama(sample["messages_for_llama"], model, host, port)
+            text, duration_ms = query_llama(
+                messages_for_layout(sample, message_layout), model, host, port,
+                temperature=temperature, seed=seed,
+            )
             print(f"{duration_ms:.0f}ms")
             results.append({"text": text, "duration_ms": duration_ms})
         except Exception as exc:
@@ -159,46 +441,67 @@ def generate_outputs(samples: list[dict], model: str, host: str, port: int) -> l
     return results
 
 
-# ---- Judge ----
-
-def call_claude(prompt: str, model: str) -> str:
-    """Call the Claude CLI and return the response text."""
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    env["CLAUDE_CODE_SKIP_UPDATE_CHECK"] = "1"
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
-    result = subprocess.run(
-        ["claude", "-p", prompt, "--model", model,
-         "--disable-slash-commands", "--allowed-tools", ""],
-        capture_output=True, text=True, timeout=600, env=env,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-def parse_judge_response(raw: str) -> dict | None:
-    """Extract JSON from judge response, handling markdown fences."""
-    # Strip markdown code fences if present
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+def parse_judge_response(raw: str, *, require_context_analysis: bool = False,
+                         require_pairwise: bool = False) -> dict | None:
+    """Extract and strictly validate a judge response."""
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+        parsed = parse_json_response(raw)
+    except (json.JSONDecodeError, ValueError):
         return None
+    required_keys = {"output_a", "output_b"}
+    if require_context_analysis:
+        required_keys.update(("context_analysis", "score_analysis"))
+    if require_pairwise:
+        required_keys.add("pairwise")
+    if set(parsed) != required_keys:
+        return None
+    for output in (parsed["output_a"], parsed["output_b"]):
+        if not isinstance(output, dict) or set(output) != set(SCORE_DIMENSIONS):
+            return None
+        if any(type(output[dimension]) is not int or not 1 <= output[dimension] <= 5
+               for dimension in SCORE_DIMENSIONS):
+            return None
+    if require_context_analysis:
+        for analysis_name in ("context_analysis", "score_analysis"):
+            analysis = parsed[analysis_name]
+            if (not isinstance(analysis, dict)
+                    or set(analysis) != {"output_a", "output_b"}):
+                return None
+            if any(not isinstance(analysis[key], str) or not analysis[key].strip()
+                   for key in ("output_a", "output_b")):
+                return None
+    if require_pairwise:
+        pairwise = parsed["pairwise"]
+        if not isinstance(pairwise, dict) or set(pairwise) != {
+            "preference", "confidence", "material_difference", "reason"
+        }:
+            return None
+        if pairwise["preference"] not in ("output_a", "output_b", "tie"):
+            return None
+        if pairwise["confidence"] not in ("low", "medium", "high"):
+            return None
+        if type(pairwise["material_difference"]) is not bool:
+            return None
+        if not isinstance(pairwise["reason"], str) or not pairwise["reason"].strip():
+            return None
+    return parsed
 
 
 def judge_one(
     sample: dict,
     baseline_text: str,
     candidate_text: str,
+    judge_provider: str,
     judge_model: str,
+    reasoning_effort: str,
     dry_run: bool,
+    assignment_seed: int,
     seed_offset: int,
     judge_template: str,
+    judge_rubric: str = "legacy",
 ) -> dict | None:
     """Judge a single sample. Returns structured result or None on failure."""
-    rng = random.Random(42 + seed_offset)
+    rng = random.Random(assignment_seed + seed_offset)
     coin = rng.random() < 0.5
 
     if coin:
@@ -214,6 +517,8 @@ def judge_one(
         output_a=output_a,
         output_b=output_b,
         custom_vocabulary=sample.get("custom_vocabulary", "(none)"),
+        window_context=sample.get("window_context", "(none)"),
+        clipboard_context=sample.get("clipboard_context", "(none)"),
     )
 
     if dry_run:
@@ -224,12 +529,28 @@ def judge_one(
 
     for attempt in range(2):
         try:
-            raw = call_claude(prompt, judge_model)
+            output_schema = CODEX_EVAL_JUDGE_SCHEMA
+            if judge_rubric in {"strict-v2", "strict-v3"}:
+                output_schema = CODEX_EVAL_JUDGE_STRICT_V2_SCHEMA
+            raw = call_llm(
+                prompt,
+                provider=judge_provider,
+                model=judge_model,
+                reasoning_effort=reasoning_effort,
+                output_schema=output_schema if judge_provider == "codex" else None,
+                timeout=600,
+            )
         except Exception as exc:
             print(f"  JUDGE ERROR: {exc}", file=sys.stderr)
             return None
 
-        parsed = parse_judge_response(raw)
+        parsed = parse_judge_response(
+            raw,
+            require_context_analysis=judge_provider == "codex",
+            require_pairwise=(
+                judge_provider == "codex" and judge_rubric in {"strict-v2", "strict-v3"}
+            ),
+        )
         if parsed and "output_a" in parsed and "output_b" in parsed:
             break
         label = "PARSE ERROR" if attempt == 0 else "PARSE ERROR (retry failed)"
@@ -247,14 +568,42 @@ def judge_one(
     if a_is == "baseline":
         baseline_scores = parsed["output_a"]
         candidate_scores = parsed["output_b"]
+        baseline_context_analysis = parsed.get("context_analysis", {}).get("output_a")
+        candidate_context_analysis = parsed.get("context_analysis", {}).get("output_b")
+        baseline_score_analysis = parsed.get("score_analysis", {}).get("output_a")
+        candidate_score_analysis = parsed.get("score_analysis", {}).get("output_b")
     else:
         baseline_scores = parsed["output_b"]
         candidate_scores = parsed["output_a"]
+        baseline_context_analysis = parsed.get("context_analysis", {}).get("output_b")
+        candidate_context_analysis = parsed.get("context_analysis", {}).get("output_a")
+        baseline_score_analysis = parsed.get("score_analysis", {}).get("output_b")
+        candidate_score_analysis = parsed.get("score_analysis", {}).get("output_a")
 
-    return {
+    result = {
         "baseline_scores": baseline_scores,
         "candidate_scores": candidate_scores,
+        "baseline_context_analysis": baseline_context_analysis,
+        "candidate_context_analysis": candidate_context_analysis,
+        "baseline_score_analysis": baseline_score_analysis,
+        "candidate_score_analysis": candidate_score_analysis,
     }
+    pairwise = parsed.get("pairwise")
+    if pairwise:
+        preference = pairwise["preference"]
+        if preference == "tie":
+            mapped_preference = "tie"
+        elif (preference == "output_a") == (a_is == "baseline"):
+            mapped_preference = "baseline"
+        else:
+            mapped_preference = "candidate"
+        result.update({
+            "pairwise_preference": mapped_preference,
+            "pairwise_confidence": pairwise["confidence"],
+            "pairwise_material_difference": pairwise["material_difference"],
+            "pairwise_reason": pairwise["reason"],
+        })
+    return result
 
 
 # ---- Scoring ----
@@ -398,7 +747,7 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
         {d: sum(v) / len(v) for d, v in per_dim_candidate.items()},
     )
 
-    return {
+    summary = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "baseline_model": baseline_model,
         "candidate_model": candidate_model,
@@ -417,6 +766,36 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
         "winner": winner,
         "winner_reason": reason,
     }
+    pairwise_judgments = [
+        judgment for judgment in judgments
+        if judgment.get("pairwise_preference") in ("baseline", "candidate", "tie")
+    ]
+    if pairwise_judgments:
+        preferences = {
+            name: sum(
+                judgment["pairwise_preference"] == name
+                for judgment in pairwise_judgments
+            )
+            for name in ("baseline", "candidate", "tie")
+        }
+        material = {
+            name: sum(
+                judgment["pairwise_preference"] == name
+                and judgment.get("pairwise_material_difference") is True
+                for judgment in pairwise_judgments
+            )
+            for name in ("baseline", "candidate")
+        }
+        summary["judge_pairwise"] = {
+            "n": len(pairwise_judgments),
+            "preferences": preferences,
+            "material_wins": material,
+            "confidence": dict(Counter(
+                judgment.get("pairwise_confidence", "unknown")
+                for judgment in pairwise_judgments
+            )),
+        }
+    return summary
 
 
 def determine_winner(b_avg, c_avg, b_dims, c_dims):
@@ -434,6 +813,48 @@ def determine_winner(b_avg, c_avg, b_dims, c_dims):
         return "candidate", f"Candidate wins {c_avg} vs {b_avg} (+{round(c_avg - b_avg, 1)})"
     else:
         return "baseline", f"Baseline wins {b_avg} vs {c_avg} (+{round(b_avg - c_avg, 1)})"
+
+
+def _model_metrics(summary: dict, role: str) -> dict:
+    """Project paired results onto identical MLflow metric names per model."""
+    metrics = {
+        "samples": summary.get("n_samples", summary.get("samples", 0)),
+        "latency": summary.get(f"{role}_latency", {}),
+    }
+    if "per_dimension" in summary:
+        metrics["quality"] = {
+            dimension: values.get(f"{role}_avg")
+            for dimension, values in summary["per_dimension"].items()
+        }
+        metrics["quality"]["overall"] = summary.get(f"{role}_avg_score")
+        wins = summary.get("wins", {})
+        metrics["pairwise_wins"] = wins.get(role, 0)
+        material = summary.get("judge_pairwise", {}).get("material_wins", {})
+        metrics["material_wins"] = material.get(role, 0)
+    return metrics
+
+
+def log_mlflow_comparison(tracking, args, summary: dict) -> None:
+    """Attach comparable metrics to two distinct MLflow Logged Models."""
+    model_ids = {}
+    for role in ("baseline", "candidate"):
+        model_name = getattr(args, role)
+        model_ids[role] = tracking.log_external_model(
+            name=model_name,
+            model_type="voiceink-transcript-cleanup",
+            params={
+                "comparison_role": role,
+                "temperature": getattr(args, f"{role}_temperature"),
+                "message_layout": getattr(args, f"{role}_message_layout"),
+            },
+            tags={"voiceink.comparison_role": role},
+            metrics=_model_metrics(summary, role),
+            dataset_role="evaluation",
+        )
+    tracking.set_tags({
+        f"voiceink.{role}_logged_model_id": model_id
+        for role, model_id in model_ids.items() if model_id
+    })
 
 
 # ---- Output ----
@@ -493,6 +914,20 @@ def print_summary(summary: dict) -> None:
           f"  95% CI [{wr_ci[0]*100:.0f}%, {wr_ci[1]*100:.0f}%]"
           f"  (ties: {w['tie']})")
 
+    judge_pairwise = summary.get("judge_pairwise")
+    if judge_pairwise:
+        preferences = judge_pairwise["preferences"]
+        material = judge_pairwise["material_wins"]
+        print(
+            "  Strict pairwise: "
+            f"candidate {preferences['candidate']}, "
+            f"baseline {preferences['baseline']}, ties {preferences['tie']}"
+        )
+        print(
+            "  Material wins:  "
+            f"candidate {material['candidate']}, baseline {material['baseline']}"
+        )
+
     # ---- Latency ----
     b_lat = summary.get("baseline_latency", {})
     c_lat = summary.get("candidate_latency", {})
@@ -519,9 +954,49 @@ def print_summary(summary: dict) -> None:
     print()
 
 
+def write_generation_outputs(path: Path, samples: list[dict],
+                             baseline_outputs: list[dict],
+                             candidate_outputs: list[dict],
+                             baseline_model: str, candidate_model: str,
+                             baseline_temperature: float = 0.3,
+                             candidate_temperature: float = 0.3,
+                             inference_seed: int | None = None,
+                             baseline_message_layout: str = "voiceink",
+                             candidate_message_layout: str = "voiceink") -> None:
+    """Persist model outputs before any external judging begins."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for index, (sample, baseline, candidate) in enumerate(
+            zip(samples, baseline_outputs, candidate_outputs)
+        ):
+            record = {
+                "sample_index": sample.get("sample_index", index),
+                "raw_transcript": sample["raw_transcript"],
+                "gold_label": sample["gold_label"],
+                "baseline_model": baseline_model,
+                "candidate_model": candidate_model,
+                "baseline_sampling": {
+                    "temperature": baseline_temperature,
+                    "seed": inference_seed,
+                    "message_layout": baseline_message_layout,
+                },
+                "candidate_sampling": {
+                    "temperature": candidate_temperature,
+                    "seed": inference_seed,
+                    "message_layout": candidate_message_layout,
+                },
+                "baseline_output": baseline["text"],
+                "candidate_output": candidate["text"],
+                "baseline_duration_ms": baseline.get("duration_ms", 0),
+                "candidate_duration_ms": candidate.get("duration_ms", 0),
+            }
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"Generated outputs: {path}")
+
+
 def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[dict],
                   candidate_outputs: list[dict], judgments: list[dict],
-                  summary: dict) -> None:
+                  summary: dict, judge_metadata: dict) -> tuple[Path, Path]:
     """Write per-sample results and summary to files."""
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -533,7 +1008,7 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
             zip(samples, baseline_outputs, candidate_outputs, judgments)
         ):
             record = {
-                "sample_index": i,
+                "sample_index": sample.get("sample_index", i),
                 "raw_transcript": sample["raw_transcript"],
                 "gold_label": sample["gold_label"],
                 "baseline_output": b_out["text"],
@@ -542,6 +1017,17 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
                 "candidate_duration_ms": c_out["duration_ms"],
                 "baseline_scores": judgment["baseline_scores"],
                 "candidate_scores": judgment["candidate_scores"],
+                "baseline_context_analysis": judgment.get("baseline_context_analysis"),
+                "candidate_context_analysis": judgment.get("candidate_context_analysis"),
+                "baseline_score_analysis": judgment.get("baseline_score_analysis"),
+                "candidate_score_analysis": judgment.get("candidate_score_analysis"),
+                "pairwise_preference": judgment.get("pairwise_preference"),
+                "pairwise_confidence": judgment.get("pairwise_confidence"),
+                "pairwise_material_difference": judgment.get(
+                    "pairwise_material_difference"
+                ),
+                "pairwise_reason": judgment.get("pairwise_reason"),
+                "judge": judge_metadata,
                 "baseline_weighted": weighted_score(judgment["baseline_scores"]),
                 "candidate_weighted": weighted_score(judgment["candidate_scores"]),
             }
@@ -553,24 +1039,115 @@ def write_results(output_dir: Path, samples: list[dict], baseline_outputs: list[
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"Summary: {summary_path}")
+    return detail_path, summary_path
 
 
 # ---- Main ----
 
 def main() -> None:
     args = parse_args()
+    if args.judge_rubric in {"strict-v2", "strict-v3"} and args.judge_provider != "codex":
+        print(
+            "--judge-rubric strict-v2/strict-v3 requires --judge-provider codex; "
+            "legacy Claude judging remains available",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    judge_model = resolve_model(args.judge_provider, args.judge_model)
+
+    judge_template = ""
+    judge_metadata = provider_metadata(
+        args.judge_provider, judge_model, args.judge_reasoning_effort
+    )
+    judge_metadata["rubric"] = args.judge_rubric
+    if not args.generate_only:
+        prompt_base = {
+            "strict-v2": STRICT_V2_JUDGE_PROMPT_PATH,
+            "strict-v3": STRICT_V3_JUDGE_PROMPT_PATH,
+        }.get(args.judge_rubric, JUDGE_PROMPT_PATH)
+        prompt_path = provider_prompt_path(prompt_base, args.judge_provider)
+        if not prompt_path.is_file():
+            print(f"Judge prompt not found: {prompt_path}", file=sys.stderr)
+            sys.exit(1)
+        judge_template = prompt_path.read_text(encoding="utf-8")
+        judge_metadata["prompt_sha256"] = hashlib.sha256(
+            judge_template.encode("utf-8")
+        ).hexdigest()
 
     if not args.eval_data.exists():
         print(f"Eval data not found: {args.eval_data}", file=sys.stderr)
         sys.exit(1)
 
-    random.seed(args.seed)
+    if args.generate_only and args.outputs:
+        print("--generate-only cannot be combined with --outputs", file=sys.stderr)
+        sys.exit(2)
+    if args.baseline_temperature < 0 or args.candidate_temperature < 0:
+        print("Inference temperatures must be non-negative", file=sys.stderr)
+        sys.exit(2)
 
-    # Load eval samples
+    # Load and validate the full corpus before applying an explicit debug slice.
     samples = load_eval_data(args.eval_data)
-    if args.limit > 0:
+    try:
+        validate_eval_corpus(
+            args.eval_data,
+            len(samples),
+            allow_noncanonical=args.allow_noncanonical_eval,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(2)
+    if args.sample_indices and args.limit > 0:
+        print("--sample-indices cannot be combined with --limit", file=sys.stderr)
+        sys.exit(2)
+    if args.sample_indices:
+        try:
+            samples = select_sample_indices(samples, args.sample_indices)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(2)
+    elif args.limit > 0:
         samples = samples[:args.limit]
     print(f"Loaded {len(samples)} eval samples")
+
+    mode = "generation" if args.generate_only else "quality"
+    tracking = start_mlflow_run(
+        args,
+        run_name=f"{args.candidate}-vs-{args.baseline}-{args.judge_rubric}-{mode}",
+        run_kind=f"evaluation.{mode}",
+        params={
+            "baseline_model": args.baseline,
+            "candidate_model": args.candidate,
+            "eval_samples": len(samples),
+            "canonical_eval": not args.allow_noncanonical_eval,
+            "baseline_temperature": args.baseline_temperature,
+            "candidate_temperature": args.candidate_temperature,
+            "inference_seed": args.inference_seed if args.inference_seed is not None else "",
+            "baseline_message_layout": args.baseline_message_layout,
+            "candidate_message_layout": args.candidate_message_layout,
+            "judge_provider": args.judge_provider,
+            "judge_model": judge_model,
+            "judge_reasoning_effort": args.judge_reasoning_effort,
+            "judge_rubric": args.judge_rubric,
+            "judge_prompt_sha256": judge_metadata.get("prompt_sha256", ""),
+            "parallel": args.parallel,
+            "seed": args.seed,
+            "dry_run": args.dry_run,
+            "resume": args.resume or "",
+            "saved_outputs": args.outputs or "",
+            "output_dir": args.output_dir,
+        },
+        datasets=[dataset_metadata("evaluation", args.eval_data, len(load_eval_data(args.eval_data)))],
+        tags={
+            "voiceink.baseline_model": args.baseline,
+            "voiceink.candidate_model": args.candidate,
+        },
+    )
+    if judge_template:
+        tracking.register_prompt(
+            name=f"voiceink-{args.judge_rubric}-{args.judge_provider}-judge",
+            template=judge_template,
+            sha256=judge_metadata["prompt_sha256"],
+        )
 
     # Load cache from previous run if resuming
     cache = {}
@@ -578,22 +1155,30 @@ def main() -> None:
         if args.resume.exists():
             cache = load_cached_results(args.resume)
             print(f"Loaded {len(cache)} cached results from {args.resume}")
+            expected_prompt_hash = judge_metadata.get("prompt_sha256")
+            compatible_cache = {
+                key: record for key, record in cache.items()
+                if record.get("judge", {}).get("prompt_sha256") == expected_prompt_hash
+            }
+            ignored = len(cache) - len(compatible_cache)
+            cache = compatible_cache
+            if ignored:
+                print(
+                    f"Ignored {ignored} cached results from a different or "
+                    "unversioned judge prompt"
+                )
         else:
             print(f"WARNING: resume file not found: {args.resume}")
 
-    # Split samples into cached vs uncached
-    cached_indices = []
-    uncached_indices = []
-    for i, sample in enumerate(samples):
-        if sample["raw_transcript"] in cache:
-            cached_indices.append(i)
-        else:
-            uncached_indices.append(i)
+    cached_indices = [
+        i for i, sample in enumerate(samples)
+        if sample["raw_transcript"] in cache
+    ]
+    uncached_indices = [i for i in range(len(samples)) if i not in cached_indices]
 
     if cache:
         print(f"  {len(cached_indices)} cached, {len(uncached_indices)} to evaluate")
 
-    # Build result arrays — pre-fill from cache
     baseline_outputs = [None] * len(samples)
     candidate_outputs = [None] * len(samples)
     judge_results = {}
@@ -611,51 +1196,133 @@ def main() -> None:
         judge_results[i] = {
             "baseline_scores": c["baseline_scores"],
             "candidate_scores": c["candidate_scores"],
+            "baseline_context_analysis": c.get("baseline_context_analysis"),
+            "candidate_context_analysis": c.get("candidate_context_analysis"),
+            "baseline_score_analysis": c.get("baseline_score_analysis"),
+            "candidate_score_analysis": c.get("candidate_score_analysis"),
+            "pairwise_preference": c.get("pairwise_preference"),
+            "pairwise_confidence": c.get("pairwise_confidence"),
+            "pairwise_material_difference": c.get(
+                "pairwise_material_difference"
+            ),
+            "pairwise_reason": c.get("pairwise_reason"),
         }
 
-    # Run inference + judging only for uncached samples
-    if uncached_indices:
+    generation_path = None
+    if args.outputs:
+        if not args.outputs.is_file():
+            print(f"Saved outputs not found: {args.outputs}", file=sys.stderr)
+            sys.exit(1)
+        saved_outputs = load_saved_outputs(args.outputs)
+        missing = []
+        for i in uncached_indices:
+            saved = (
+                saved_outputs.get(samples[i]["raw_transcript"])
+                or saved_outputs.get(i)
+            )
+            if not saved:
+                missing.append(i)
+                continue
+            baseline_outputs[i] = saved["baseline"]
+            candidate_outputs[i] = saved["candidate"]
+        if missing:
+            print(
+                f"Saved outputs are missing {len(missing)} selected eval samples",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"Loaded outputs for {len(uncached_indices)} samples from {args.outputs}")
+    elif uncached_indices:
         uncached_samples = [samples[i] for i in uncached_indices]
-
-        # Warm up + generate for each model
         warmup_msgs = [{"role": "user", "content": "Hello"}]
 
-        print(f"Warming up {args.baseline}...", end=" ", flush=True)
-        try:
-            _, ms = query_llama(warmup_msgs, args.baseline, args.llama_host, args.llama_port)
-            print(f"{ms:.0f}ms (discarded)")
-        except Exception as exc:
-            print(f"WARNING: warmup failed: {exc}")
+        for model_name, temperature, message_layout, destination in (
+            (args.baseline, args.baseline_temperature,
+             args.baseline_message_layout, baseline_outputs),
+            (args.candidate, args.candidate_temperature,
+             args.candidate_message_layout, candidate_outputs),
+        ):
+            print(
+                f"Warming up {model_name} (temperature={temperature:g}, "
+                f"layout={message_layout})...",
+                end=" ", flush=True,
+            )
+            try:
+                _, milliseconds = query_llama(
+                    warmup_msgs, model_name, args.llama_host, args.llama_port,
+                    temperature=temperature, seed=args.inference_seed,
+                )
+                print(f"{milliseconds:.0f}ms (discarded)")
+            except Exception as exc:
+                print(f"WARNING: warmup failed: {exc}")
 
-        print(f"\nGenerating baseline outputs ({args.baseline})...")
-        b_outs = generate_outputs(uncached_samples, args.baseline, args.llama_host, args.llama_port)
+            print(
+                f"\nGenerating outputs ({model_name}, temperature={temperature:g}, "
+                f"layout={message_layout})..."
+            )
+            generated = generate_outputs(
+                uncached_samples, model_name, args.llama_host, args.llama_port,
+                temperature=temperature, seed=args.inference_seed,
+                message_layout=message_layout,
+            )
+            for position, sample_index in enumerate(uncached_indices):
+                destination[sample_index] = generated[position]
 
-        print(f"\nWarming up {args.candidate}...", end=" ", flush=True)
-        try:
-            _, ms = query_llama(warmup_msgs, args.candidate, args.llama_host, args.llama_port)
-            print(f"{ms:.0f}ms (discarded)")
-        except Exception as exc:
-            print(f"WARNING: warmup failed: {exc}")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        generation_path = args.generation_output or (
+            args.output_dir / f"generations_{timestamp}.jsonl"
+        )
+        write_generation_outputs(
+            generation_path, samples, baseline_outputs, candidate_outputs,
+            args.baseline, args.candidate,
+            args.baseline_temperature, args.candidate_temperature,
+            args.inference_seed, args.baseline_message_layout,
+            args.candidate_message_layout,
+        )
 
-        print(f"\nGenerating candidate outputs ({args.candidate})...")
-        c_outs = generate_outputs(uncached_samples, args.candidate, args.llama_host, args.llama_port)
+    if args.generate_only:
+        generation_summary = {
+            "samples": len(samples),
+            "baseline_latency": _latency_stats(sorted(
+                output["duration_ms"] for output in baseline_outputs
+                if output and output.get("duration_ms")
+            )),
+            "candidate_latency": _latency_stats(sorted(
+                output["duration_ms"] for output in candidate_outputs
+                if output and output.get("duration_ms")
+            )),
+        }
+        tracking.log_metrics(generation_summary)
+        log_mlflow_comparison(tracking, args, generation_summary)
+        if generation_path is not None:
+            tracking.log_dict(
+                {"outputs": [output_reference(
+                    "private_generations", generation_path, private=True
+                )]},
+                "metadata/outputs.json",
+            )
+        tracking.finish()
+        print("Generation-only run complete; no judge was called.")
+        return
 
-        for j, i in enumerate(uncached_indices):
-            baseline_outputs[i] = b_outs[j]
-            candidate_outputs[i] = c_outs[j]
-
-        # Judge uncached pairs
-        judge_template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
-        print(f"\nJudging {len(uncached_indices)} new outputs ({args.judge_model})...")
-        errors = 0
+    errors = 0
+    if uncached_indices:
+        print(
+            f"\nJudging {len(uncached_indices)} new outputs "
+            f"({args.judge_provider}/{judge_model}, "
+            f"effort={args.judge_reasoning_effort})..."
+        )
 
         if args.parallel <= 1 or args.dry_run:
             for j, i in enumerate(uncached_indices):
                 print(f"  [{j+1}/{len(uncached_indices)}]", end=" ")
-                result = judge_one(samples[i], baseline_outputs[i]["text"],
-                                  candidate_outputs[i]["text"],
-                                  args.judge_model, args.dry_run, i,
-                                  judge_template)
+                result = judge_one(
+                    samples[i], baseline_outputs[i]["text"],
+                    candidate_outputs[i]["text"], args.judge_provider,
+                    judge_model, args.judge_reasoning_effort, args.dry_run,
+                    args.seed, samples[i]["sample_index"], judge_template,
+                    args.judge_rubric,
+                )
                 judge_results[i] = result
                 if not result:
                     errors += 1
@@ -663,11 +1330,13 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.parallel) as pool:
                 futures = {}
                 for j, i in enumerate(uncached_indices):
-                    fut = pool.submit(judge_one, samples[i],
-                                      baseline_outputs[i]["text"],
-                                      candidate_outputs[i]["text"],
-                                      args.judge_model, False, i,
-                                      judge_template)
+                    fut = pool.submit(
+                        judge_one, samples[i], baseline_outputs[i]["text"],
+                        candidate_outputs[i]["text"], args.judge_provider,
+                        judge_model, args.judge_reasoning_effort, False,
+                        args.seed, samples[i]["sample_index"], judge_template,
+                        args.judge_rubric,
+                    )
                     futures[fut] = i
 
                 done_count = 0
@@ -684,10 +1353,11 @@ def main() -> None:
                     if not result:
                         errors += 1
     else:
-        errors = 0
         print("\nAll samples cached, skipping inference and judging.")
 
     if args.dry_run:
+        tracking.set_tags({"voiceink.dry_run": "true"})
+        tracking.finish()
         print("\nDry run complete.")
         return
 
@@ -709,11 +1379,32 @@ def main() -> None:
     # Aggregate and print
     summary = aggregate(filtered_judgments, filtered_baseline, filtered_candidate,
                         args.baseline, args.candidate)
+    summary["judge"] = judge_metadata
     print_summary(summary)
 
     # Write results
-    write_results(args.output_dir, filtered_samples, filtered_baseline,
-                  filtered_candidate, filtered_judgments, summary)
+    detail_path, summary_path = write_results(
+        args.output_dir, filtered_samples, filtered_baseline,
+        filtered_candidate, filtered_judgments, summary, judge_metadata,
+    )
+    tracking.log_metrics(summary)
+    log_mlflow_comparison(tracking, args, summary)
+    tracking.log_metrics({"failed_samples": errors})
+    tracking.set_tags({
+        "voiceink.winner": summary["winner"],
+        "voiceink.complete_440": str(summary["n_samples"] == 440).lower(),
+    })
+    tracking.log_artifact(summary_path, artifact_path="summaries")
+    references = [
+        output_reference("private_evaluation_details", detail_path, private=True),
+        output_reference("evaluation_summary", summary_path, private=False),
+    ]
+    if args.outputs:
+        references.append(output_reference(
+            "private_generation_input", args.outputs, private=True
+        ))
+    tracking.log_dict({"outputs": references}, "metadata/outputs.json")
+    tracking.finish()
 
 
 if __name__ == "__main__":

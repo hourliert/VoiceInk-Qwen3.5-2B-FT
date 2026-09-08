@@ -6,6 +6,13 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
 
 **[Read the full blog post](docs/BLOG_POST.md)** for the complete story — from initial setup through five training iterations, a production bug caused by repetition amplification, and the synthetic data fix.
 
+> **Current workflow:** New data, training, evaluation, and promotion must use the
+> manifest-driven [canonical pipeline](docs/CANONICAL_PIPELINE.md). The older
+> commands below are retained as historical and low-level implementation references.
+> Historical datasets, checkpoints, VoiceInk models, and evals are isolated under
+> explicit `legacy/` namespaces; canonical artifacts live under `releases/` or
+> `canonical/` namespaces and are linked to MLflow by immutable fingerprints.
+
 ## How it works
 
 ```
@@ -21,7 +28,7 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
                     ┌─────────────┼──────────────┐
                     ▼             ▼              ▼
               Label with    Generate         Evaluate
-              Claude judge  synthetic data   A/B with judge
+              LLM provider  synthetic data   A/B with judge
                     │             │              │
                     ▼             ▼              ▼
               datasets/     datasets/        results/
@@ -43,12 +50,19 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
 
 - **Host machine**: Remote gaming PC (RTX 4080 Super, 16GB VRAM) running Linux, accessible from the Mac over the network.
 - **LLM backend**: [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-server`) on port 8002, serving multiple Qwen 3.5 model variants via an OpenAI-compatible API.
-- **Reverse proxy**: A lightweight Python proxy (`src/voiceink_proxy/server.py`) on port 8001 that forwards VoiceInk requests to llama-server and logs every request/response pair as JSONL for training data collection.
-- **Startup**: `bin/start.sh` launches both processes. A systemd unit (`systemd/llama-router.service`) runs it on boot.
+- **Reverse proxy**: A lightweight Python proxy (`src/voiceink_proxy/server.py`) on port 8001 that forwards VoiceInk requests to llama-server and appends every request/response pair to JSONL.
+- **Control plane**: A React + TypeScript application backed by the Python API on port 8003. A crash-safe cursor ingests the proxy JSONL into the authoritative SQLite registry; ten Luna workers and a durable maintenance outbox operate independently of HTTP reads.
+- **Experiment tracking**: MLflow on port 5000 remains the source of truth for training/evaluation runs, metrics, prompts, artifacts, and model lineage.
+- **Startup**: `bin/start.sh` builds the local Vite bundle and launches llama-server, the proxy, the VoiceInk control plane, and MLflow. A systemd unit (`systemd/llama-router.service`) runs the same stack on boot.
 
 ## The fine-tuning pipeline
 
-The entire fine-tuning pipeline — from raw proxy logs to a deployed GGUF model — is built with Python (standard library only, no pip dependencies for the pipeline scripts) and [Claude](https://claude.ai) as an LLM judge via the [Claude CLI](https://github.com/anthropics/claude-code).
+The pipeline scripts use Python's standard library and support either Claude CLI
+or Codex CLI for labeling, validation, synthetic generation, and evaluation.
+Claude remains the default for backwards compatibility; Codex defaults to
+`gpt-5.6-luna` with low reasoning and a fresh ephemeral session per sample.
+Each provider has its own prompt file so its instructions and output format can
+be tuned independently.
 
 ### 1. Data collection
 
@@ -72,9 +86,13 @@ The proxy logs these verbatim to `logs/voiceink_proxy_requests.jsonl`. A shared 
 ```bash
 python3 src/labeling/label.py --parallel 5
 python3 src/labeling/label.py --limit 50 --force  # relabel a subset
+python3 src/labeling/label.py --provider codex --parallel 3
 ```
 
-The labeling script sends each logged transcript to **Claude Sonnet 4.6** with a detailed judge prompt (`src/labeling/judge_prompt.txt`) that specifies exactly how to clean the transcript. Claude produces the gold-standard label — the ideal cleaned version of each transcript.
+The labeling script sends each logged transcript to the configured provider,
+which produces the gold-standard cleaned transcript. Claude uses the legacy
+`src/labeling/judge_prompt.txt`; Codex uses the separately maintained
+`src/labeling/judge_prompt.codex.txt` and a strict JSON schema.
 
 The judge prompt encodes rules for:
 - Filler word removal ("so", "like", "basically", "um")
@@ -83,29 +101,92 @@ The judge prompt encodes rules for:
 - Word splitting recombination ("voice ink" → "VoiceInk")
 - Preserving meaning, tone, and speaker opinions faithfully
 
-Output: `datasets/labeled.jsonl` — each record contains the original request, the model's original response, and Claude's gold-standard label. Dedup-safe by `request_id`.
+Output: `datasets/labeled.jsonl` — each record contains the original request,
+the model's original response, provider provenance, and the gold-standard
+label. It is dedup-safe by `request_id`.
+
+To calibrate a new provider against existing labels without touching the main
+dataset:
+
+```bash
+python3 src/labeling/label.py \
+  --provider codex --model gpt-5.6-luna --reasoning-effort low \
+  --reference-labels datasets/labeled.jsonl \
+  --output datasets/calibration/luna56-low.jsonl \
+  --shuffle --seed 42 --limit 20 --parallel 3
+
+python3 src/labeling/validate.py \
+  --input datasets/calibration/luna56-low.jsonl --show-calibration
+```
 
 #### Label validation
 
 ```bash
 python3 src/labeling/validate.py --parallel 10
+python3 src/labeling/validate.py --provider codex --parallel 3
 python3 src/labeling/validate.py --show-failures       # review flagged records
 python3 src/labeling/validate.py --force --parallel 10  # re-validate all
 ```
 
-A lightweight quality gate that runs each label through **Claude Sonnet 4.6** to check for meaning alteration, hallucination, over-deletion, repetition, or broken output. Results are written back into `labeled.jsonl` as a `validation` field on each record. Already-validated records are skipped unless `--force` is set.
+A lightweight quality gate checks each label for meaning alteration,
+hallucination, over-deletion, repetition, or broken output. Claude uses
+`validate_prompt.txt`; Codex uses `validate_prompt.codex.txt`. Results are
+written back into `labeled.jsonl` as a `validation` field. Already-validated
+records are skipped unless `--force` is set.
 
-`prepare_dataset.py` automatically excludes records where `validation.status == "fail"` (override with `--include-failed`).
+Validation is triage, not automatic training approval. Real records enter the
+training dataset after either conservative automatic approval or a human
+approval/edit. Run deterministic triage after validation to auto-approve only
+records that pass both the LLM validator and all local ambiguity checks:
+
+```bash
+python3 src/labeling/triage.py \
+  --input datasets/strategic/luna56-pilot-100.jsonl \
+  --input datasets/strategic/luna56-batch-900.jsonl \
+  --migrate-legacy-reviewed \
+  --apply
+```
+
+The remaining records are the human-review queue. Open the local review UI for
+that queue, all unreviewed records, or an exact manifest of request IDs:
+
+```bash
+# Validator failures only (default)
+python3 src/labeling/review_server.py --input datasets/labeled.jsonl
+
+# Failures, missing validations, and suspicious validator passes
+python3 src/labeling/review_server.py \
+  --input datasets/labeled.jsonl \
+  --input datasets/another-labeled-batch.jsonl \
+  --mode suspicious \
+  --host 0.0.0.0 --port 8004
+
+# Exact request IDs from a text or JSONL manifest
+python3 src/labeling/review_server.py \
+  --input datasets/labeled.jsonl --ids-file datasets/review.jsonl
+```
+
+The VoiceInk Control Plane is started with the router at `http://192.168.1.150:8003`; see [the control-plane guide](docs/CONTROL_PLANE.md) and [the review workflow](docs/LIVE_REVIEW.md). For the separate batch reviewer above, browse to `http://<machine-LAN-IP>:8004` when binding to `0.0.0.0`. The
+review server has no authentication, so expose it only on a trusted local
+network. Automatic approvals are stored as `auto_review`; only UI decisions
+are stored as `manual_review`. Approve and Save Edit make a record eligible
+for training; Reject keeps it excluded. The suspicious heuristics prefer false
+alarms over silently accepting ambiguous names, numbers, negations, garbled
+phrases, or unusually large rewrites.
 
 ### 3. Synthetic data generation
 
 ```bash
 python3 src/synthetic/generate.py --count 160 --parallel 5
+python3 src/synthetic/generate.py --provider codex --count 20 --parallel 3
 ```
 
 The fine-tuned model initially failed on long QA debrief transcripts (500-3500 words) — it amplified repetitive coaching phrases and filled the entire 16K context window. The root cause: only 10 long samples existed in 1,451 training records.
 
-The synthetic generator uses Claude Sonnet 4.6 to produce realistic QA debrief transcripts for [GT Coach](https://gtcoach.app) (a sim-racing coaching app). Each sample includes:
+The synthetic generator uses the configured provider to produce realistic QA
+debrief transcripts for [GT Coach](https://gtcoach.app) (a sim-racing coaching
+app). Claude and Codex use separate `generator_prompt.txt` and
+`generator_prompt.codex.txt` templates. Each sample includes:
 - Naturally repetitive corner-by-corner coaching phrases ("Corner 2, brake one beat earlier. It carried into corner 3. Your mid-corner speed is down.")
 - Realistic STT errors at proper density
 - Speaker narration interleaved with coaching feedback
@@ -156,16 +237,213 @@ The script auto-snapshots `datasets/labeled.jsonl` before training and auto-back
 - `--load-in-8bit` — loads in 8-bit (moderate savings)
 - `--offload-optimizer` — moves optimizer states to CPU RAM (no quality impact, slower)
 
+#### Qwen3.5 2B VoiceInk v2
+
+The v2 recipe keeps the existing 3,065 training samples and locked 340-sample
+regression evaluation. It adds reviewed strategic labels after deduplication,
+reserves a deterministic 100-sample engineering holdout, and quarantines
+inputs that could exceed the 16,384-token training context.
+
+```bash
+# Rebuild the deterministic split and its hashes/distribution report.
+.venv/bin/python3 src/training/prepare_qwen_v2.py
+
+# Validate the recipe without loading a model or using the GPU.
+.venv/bin/python3 src/training/finetune.py \
+  --train datasets/qwen35-2b-voiceink-v2/train.jsonl \
+  --eval datasets/qwen35-2b-voiceink-v2/eval-regression-340.jsonl \
+  --epochs 2 \
+  --lora-dir training/qwen35-2b-voiceink-v2/lora \
+  --output-dir training/qwen35-2b-voiceink-v2/outputs \
+  --gguf-base models/Qwen3.5-2B-VoiceInk-v2 \
+  --export-gguf q4_k_m q8_0 \
+  --check-only
+
+# One optimizer step; no GGUF export.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune.py \
+  --train datasets/qwen35-2b-voiceink-v2/train.jsonl \
+  --eval datasets/qwen35-2b-voiceink-v2/eval-regression-340.jsonl \
+  --epochs 2 --max-steps 1 \
+  --lora-dir training/qwen35-2b-voiceink-v2/smoke-lora \
+  --output-dir training/qwen35-2b-voiceink-v2/smoke-outputs \
+  --gguf-base models/Qwen3.5-2B-VoiceInk-v2
+
+# Full two-epoch run and isolated Q4_K_M/Q8_0 exports.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune.py \
+  --train datasets/qwen35-2b-voiceink-v2/train.jsonl \
+  --eval datasets/qwen35-2b-voiceink-v2/eval-regression-340.jsonl \
+  --epochs 2 \
+  --lora-dir training/qwen35-2b-voiceink-v2/lora \
+  --output-dir training/qwen35-2b-voiceink-v2/outputs \
+  --gguf-base models/Qwen3.5-2B-VoiceInk-v2 \
+  --export-gguf q4_k_m q8_0
+```
+
+The llama-server alias should be `Qwen3.5-2B-VoiceInk-v2`; the export
+directory is `models/Qwen3.5-2B-VoiceInk-v2_gguf`.
+
+#### Qwen3.5 0.8B VoiceInk experiment
+
+The dedicated 0.8B entry point reuses the exact locked V3 training samples
+(`3,962` rows) and regression evaluation (`340` rows) from the latest 2B V3
+run. It keeps the same one-epoch LoRA recipe (`r=32`, `alpha=64`, effective
+batch size 8, `2e-4` learning rate), but uses batch 4 with two accumulation
+steps and loss-only eval batches of 4 for better GPU utilization. Evaluation
+and checkpoint intervals are automatically aligned so the terminal optimizer
+step is always eligible for best-model selection. All new checkpoints and
+exports remain isolated under `qwen35-08b-voiceink-v1` paths.
+
+```bash
+# Validate paths, hashes, sample counts, and the resolved recipe without a GPU.
+.venv/bin/python3 src/training/finetune_qwen35_08b.py --check-only
+
+# Load the cached base model and complete exactly one optimizer step.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_qwen35_08b.py \
+  --max-steps 1 \
+  --save-steps 1 \
+  --lora-dir training/qwen35-08b-voiceink-v1/smoke-lora \
+  --output-dir training/qwen35-08b-voiceink-v1/smoke-outputs
+
+# Full V3-equivalent run; retain the lowest regression-eval-loss checkpoint,
+# then export both deployment and diagnostic quantizations.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_qwen35_08b.py \
+  --load-best-model-at-end \
+  --export-gguf q4_k_m q8_0
+```
+
+The base checkpoint is `unsloth/Qwen3.5-0.8B` in the normal Hugging Face
+cache. Final GGUFs are written to
+`models/Qwen3.5-0.8B-VoiceInk-v1_gguf`; the smoke run never exports a model.
+
+#### LFM2.5 1.2B experiment
+
+LFM2.5 uses the same reviewed VoiceInk labels and synthetic samples, but its
+text-only chat template expects string message content. Keep its prepared data,
+LoRA adapter, checkpoints, and GGUF exports isolated from the Qwen workflow:
+
+```bash
+python3 src/training/prepare_dataset.py \
+  --content-format string \
+  --extra-input datasets/synthetic/labeled.jsonl \
+  --output datasets/lfm25/train.jsonl \
+  --eval-output datasets/lfm25/eval.jsonl
+
+# Validates data and configuration without loading a model or using the GPU.
+.venv/bin/python3 src/training/finetune_lfm25.py \
+  --check-only --export-gguf q4_k_m q8_0
+```
+
+The dedicated trainer defaults to `LiquidAI/LFM2.5-1.2B-Instruct`, a 16K
+training context, LoRA rank/alpha 16, an effective batch size of 8, one epoch,
+and completions-only loss. Run a one-step smoke test before the full job; use
+`--load-in-4bit` if the BF16 smoke test exceeds available VRAM. The `--check-only` path exits before importing Unsloth or loading the model.
+
+For a controlled comparison with Qwen3.5 0.8B, convert the exact locked V3
+conversations and use the isolated V3 profile:
+
+```bash
+.venv/bin/python3 src/training/prepare_lfm25_v3.py
+.venv/bin/python3 src/training/finetune_lfm25_12b_v3.py --check-only
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_12b_v3.py \
+  --export-gguf q4_k_m q8_0
+```
+
+The V3 profile uses batch 4 with two accumulation steps, eval batch 4, aligned
+terminal evaluation, best-checkpoint selection, and isolated
+`lfm25-1.2b-voiceink-v3` paths.
+
+#### LFM2.5 2.6B Base experiment
+
+The 2.6B Base recipe reuses the reviewed LFM string-format dataset but keeps
+its adapter, checkpoints, and model exports separate. It defaults to 4-bit
+compatible LoRA rank/alpha 32, two epochs, a `1e-4` learning rate, and the
+same 16K context and effective batch size of 8.
+
+```bash
+# Validate paths, dataset hashes, and the complete recipe without loading a model.
+.venv/bin/python3 src/training/finetune_lfm25_26b_base.py \
+  --check-only --load-in-4bit --export-gguf q4_k_m q8_0
+
+# Load the model and complete exactly one optimizer step; do not export.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_base.py \
+  --max-steps 1 \
+  --load-in-4bit \
+  --lora-dir training/lfm25-2.6b-base/smoke-lora \
+  --output-dir training/lfm25-2.6b-base/smoke-outputs
+
+# Full two-epoch run followed by Q4_K_M and Q8_0 GGUF exports.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_base.py \
+  --load-in-4bit \
+  --export-gguf q4_k_m q8_0
+```
+
+#### LFM2.5 2.6B VoiceInk V3 controlled rerun
+
+This profile uses the same locked 3,962-sample V3 training set and 340-sample
+training regression set as the Qwen3.5 V3 recipe. It runs one epoch with LoRA
+rank/alpha 32/64, an effective batch size of 8, completions-only loss, and an
+evaluation/checkpoint interval aligned to include the terminal optimizer step.
+
+```bash
+# Rebuild the deterministic LFM string conversion and validate the full recipe.
+.venv/bin/python3 src/training/prepare_lfm25_v3.py
+.venv/bin/python3 src/training/finetune_lfm25_26b_v3.py \
+  --check-only \
+  --load-best-model-at-end \
+  --export-gguf q4_k_m q8_0
+
+# One-step BF16 smoke test without the 340-row evaluation or export.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_v3.py \
+  --max-steps 1 \
+  --skip-eval \
+  --lora-dir training/lfm25-2.6b-voiceink-v3/smoke-lora \
+  --output-dir training/lfm25-2.6b-voiceink-v3/smoke-outputs
+
+# Full BF16 run, selecting the best checkpoint and exporting Q4_K_M and Q8_0.
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/python3 src/training/finetune_lfm25_26b_v3.py \
+  --load-best-model-at-end \
+  --export-gguf q4_k_m q8_0
+```
+
+If the BF16 smoke test runs out of memory, first retry it with
+`--batch-size 2 --grad-accum 4 --eval-batch-size 2`. This preserves the
+effective batch size. Add `--load-in-4bit` only if that smaller BF16 batch also
+does not fit.
+
 ### 6. Evaluation
 
 ```bash
 python3 src/eval/evaluate.py --baseline Qwen3.5-4B --candidate Qwen3.5-2B-VoiceInk
 ```
 
-Runs blind A/B evaluation using Claude Sonnet 4.6 as judge. For each eval sample:
+Full evaluations are locked to
+`datasets/qwen35-2b-voiceink-v3/eval-all-440.jsonl`: 340 regression samples
+plus 100 engineering holdouts. The evaluator validates the path, row count,
+and SHA-256 fingerprint before generation or judging. A different corpus
+requires the explicit `--allow-noncanonical-eval` escape hatch; `--limit`
+and `--sample-indices` only select debug slices after the 440-source check.
+
+Runs blind A/B evaluation using the configured judge provider. For each eval sample:
 1. Both models generate a cleaned transcript
 2. Outputs are randomly assigned as "Response A" / "Response B"
-3. Claude scores each on 6 weighted dimensions
+3. The judge scores each on 6 weighted dimensions
+
+The Codex/Luna rubric also receives the current-window and clipboard context
+used by the local models. It treats those sources as disambiguation evidence
+rather than extra dictated content and stores concise context and score
+analyses for each output in the result JSONL. The legacy Claude prompt and
+output format remain available unchanged. Use `--sample-indices` for a
+deterministic calibration slice without regenerating model outputs.
 
 **Scoring rubric** (from `src/eval/judge_prompt.txt`):
 
@@ -178,7 +456,121 @@ Runs blind A/B evaluation using Claude Sonnet 4.6 as judge. For each eval sample
 | Technical accuracy | 2x | Are technical terms, names, numbers correct? |
 | Conciseness | 1x | Is unnecessary verbosity removed? |
 
-Supports `--resume` for interrupted evaluations and `--parallel` for concurrent judge calls.
+Supports `--resume` for interrupted evaluations and `--parallel` for
+concurrent judge calls. Generation and judging can also be split, which avoids
+keeping local inference models loaded while external judges run:
+
+```bash
+python3 src/eval/evaluate.py \
+  --baseline Qwen3.5-2B-VoiceInk --candidate LFM2.5-1.2B-VoiceInk \
+  --generate-only --generation-output results/lfm25-generations.jsonl
+
+python3 src/eval/evaluate.py \
+  --baseline Qwen3.5-2B-VoiceInk --candidate LFM2.5-1.2B-VoiceInk \
+  --outputs results/lfm25-generations.jsonl \
+  --judge-provider codex --judge-model gpt-5.6-luna \
+  --judge-reasoning-effort low --parallel 3
+```
+
+### 7. MLflow experiment tracking
+
+All Qwen/LFM SFT trainers, the Qwen DPO trainer, quality evaluation, and paired
+inference-speed benchmark log to the `voiceink-training`,
+`voiceink-evaluation`, or `voiceink-benchmarks` MLflow experiment by default.
+Training metrics are streamed live through the Transformers MLflow callback.
+The Model Training experience receives native metadata-only Dataset inputs and
+MLflow 3 Logged Models. Each Logged Model is linked to its training run, eval
+loss, and dataset fingerprint, while its LoRA/GGUF weights remain external and
+local. Live trainer metrics, CPU/RAM, and GPU utilization are recorded during
+training. Dataset manifests contain paths, row counts, byte sizes, and SHA-256
+fingerprints; private JSONL rows are never uploaded.
+
+Quality comparisons belong to the GenAI workflow: the non-private strict-v2
+Luna judge prompt is versioned in Prompt Registry and linked to each run, while
+aggregate scores and a safe summary are logged for comparison. GenAI tracing is
+deliberately disabled because automatic traces capture prompt inputs and model
+outputs; private transcripts, generated text, and per-sample judgments remain
+local as path/size/hash references. The MLflow UI's **GenAI / Model training**
+switch is a workspace view selector rather than a per-run setting.
+
+Install MLflow if needed. In normal operation `bin/start.sh` starts and
+supervises it automatically at `http://192.168.1.150:5000`:
+
+```bash
+.venv/bin/pip install 'mlflow>=3.15,<4'
+```
+
+To start it immediately as a standalone process (for development or before
+restarting the router service), run:
+
+```bash
+bin/start-mlflow.sh
+```
+
+`bin/start.sh` reuses an already healthy standalone instance instead of
+starting a duplicate. Set `MLFLOW_AUTOSTART=0` only when intentionally running
+MLflow separately.
+
+The default UI is `http://192.168.1.150:5000`. Override the interface or CORS
+origin without editing the script:
+
+```bash
+MLFLOW_HOST=192.168.1.151 \
+MLFLOW_CORS_ALLOWED_ORIGINS=http://192.168.1.151:5000 \
+  bin/start-mlflow.sh
+```
+
+Every tracked CLI accepts `--mlflow-tracking-uri`, `--mlflow-experiment`,
+`--mlflow-run-name`, and `--mlflow-run-id` (to resume/enrich a run). Use
+`--no-mlflow` only for an intentional untracked run.
+The environment variable `MLFLOW_TRACKING_URI` overrides the repository's LAN
+default.
+
+Completed trainer states can be imported without rerunning training:
+
+```bash
+.venv/bin/python3 src/training/backfill_mlflow.py \
+  --training-output training/lfm25-2.6b-voiceink-v3/outputs \
+  --run-name LFM2.5-2.6B-VoiceInk-v3 \
+  --base-model LiquidAI/LFM2.5-2.6B-Base \
+  --train-data datasets/lfm25-v3/train.jsonl \
+  --eval-data datasets/lfm25-v3/eval-regression-340.jsonl \
+  --lora-dir training/lfm25-2.6b-voiceink-v3/lora \
+  --gguf-dir models/LFM2.5-2.6B-VoiceInk-v3_gguf
+```
+
+#### Raw model speed screening
+
+Use the paired HTTP benchmark for a production-layout latency check before
+investing in a fine-tuning run. It samples the locked 440 corpus, warms both
+servers, alternates request order, and reports wall latency plus prompt and
+generation throughput. Start the candidate on an isolated port while the
+production Qwen model remains available on port 8002:
+
+```bash
+hf download LiquidAI/LFM2.5-8B-A1B-GGUF \
+  LFM2.5-8B-A1B-Q4_K_M.gguf LICENSE README.md \
+  --local-dir models/LFM2.5-8B-A1B-GGUF
+
+/home/thomas/llama.cpp/llama-server \
+  --host 127.0.0.1 --port 41788 --parallel 1 \
+  --flash-attn on --jinja --metrics \
+  --reasoning off --reasoning-budget 0 \
+  --alias LFM2.5-8B-A1B --ctx-size 16384 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --temperature 0.2 --top-k 80 --repeat-penalty 1.05 \
+  --model models/LFM2.5-8B-A1B-GGUF/LFM2.5-8B-A1B-Q4_K_M.gguf
+
+python3 src/eval/benchmark_inference_speed.py \
+  --baseline-model Qwen3.5-2B-VoiceInk-v3 --baseline-port 8002 \
+  --candidate-model LFM2.5-8B-A1B --candidate-port 41788 \
+  --samples 20 --warmups 2 --temperature 0 \
+  --output results/lfm25-8b-a1b-vs-qwen2b-v3-speed.json
+```
+
+The `LFM2.5-8B-A1B` preset in `config/models.ini` disables reasoning by
+construction. Without that setting, hidden chain-of-thought tokens dominate
+end-to-end latency and make a raw throughput comparison misleading.
 
 ## Results
 
@@ -237,21 +629,22 @@ docs/
 src/
   voiceink_proxy/server.py       # Reverse proxy with JSONL logging
   common/extract.py              # Structured XML extraction from requests
+  common/llm_cli.py              # Claude/Codex CLI provider adapters
   labeling/
-    label.py                     # Gold-standard label generation (Claude judge)
-    judge_prompt.txt             # Labeling judge prompt
-    validate.py                  # Label quality validation (Haiku reviewer)
-    validate_prompt.txt          # Validation reviewer prompt
+    label.py                     # Gold-standard label generation
+    judge_prompt*.txt            # Provider-specific labeling prompts
+    validate.py                  # Label quality validation
+    validate_prompt*.txt         # Provider-specific validation prompts
   synthetic/
     generate.py                  # Synthetic QA debrief generator
-    generator_prompt.txt         # Generator prompt template
+    generator_prompt*.txt        # Provider-specific generator prompts
   training/
     show_distribution.py         # Dataset distribution by input word count
     prepare_dataset.py           # Convert labels to training format
     finetune.py                  # Unsloth LoRA fine-tuning + GGUF export
   eval/
     evaluate.py                  # A/B evaluation pipeline
-    judge_prompt.txt             # Evaluation scoring rubric
+    judge_prompt*.txt            # Provider-specific evaluation rubrics
 Modelfile                            # Ollama model definition
 datasets/                        # Training data (gitignored, *.jsonl)
 models/                          # GGUF model files (gitignored)
@@ -266,7 +659,7 @@ results/                         # Evaluation results (gitignored)
 - Linux machine with NVIDIA GPU (16GB+ VRAM recommended)
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) built with CUDA support
 - Python 3.12+ with a venv containing [Unsloth](https://github.com/unslothai/unsloth) and PyTorch
-- [Claude CLI](https://github.com/anthropics/claude-code) installed and authenticated (for labeling, synthetic data, and evaluation)
+- Claude CLI and/or Codex CLI installed and authenticated for provider-backed workflows
 - A Qwen 3.5 2B base model in GGUF format
 
 ### Steps
@@ -383,5 +776,6 @@ VoiceInk sends its own system prompt with each request (overriding the Modelfile
 - [Unsloth](https://github.com/unslothai/unsloth) — LoRA fine-tuning
 - [Qwen 3.5](https://huggingface.co/Qwen) — Base model family
 - [Claude](https://claude.ai) via [Claude CLI](https://github.com/anthropics/claude-code) — Labeling judge, synthetic data generation, evaluation judge
+- [OpenAI Codex](https://developers.openai.com/codex) — Optional ephemeral labeling, validation, generation, and evaluation provider
 - [VoiceInk](https://voiceink.app) — macOS dictation app (the client)
 - [GT Coach](https://gtcoach.app) — Sim-racing coaching app (source of QA debrief transcripts)

@@ -1,5 +1,5 @@
 [Unit]
-Description=llama.cpp router server for Qwen3.5-9B and Qwen3.5-4B
+Description=VoiceInk router, proxy, live review, and MLflow services
 After=network-online.target
 Wants=network-online.target
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate gold-standard labels for VoiceInk transcription samples using Claude as judge.
+"""Generate gold-standard labels for VoiceInk transcription samples using an LLM.
 
 Reads raw request logs, sends the original VoiceInk input (system prompt + user
-message) to Claude with a judge wrapper prompt, and writes the labeled dataset
+message) to a configured CLI provider, and writes the labeled dataset
 to a JSONL file. Already-labeled request IDs are skipped.
 
 Usage:
@@ -12,9 +12,7 @@ Usage:
 """
 import argparse
 import json
-import os
 import random
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,14 +21,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from common.extract import extract_from_record
+from common.llm_cli import (
+    LABEL_SCHEMA,
+    add_provider_args,
+    call_llm,
+    parse_json_response,
+    provider_metadata,
+    provider_prompt_path,
+    resolve_model,
+)
 DEFAULT_INPUT = ROOT / "logs" / "voiceink_proxy_requests.jsonl"
 DEFAULT_OUTPUT = ROOT / "datasets" / "labeled.jsonl"
-DEFAULT_MODEL = "claude-sonnet-4-6"
 JUDGE_PROMPT_PATH = Path(__file__).resolve().parent / "judge_prompt.txt"
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Label VoiceInk transcription samples using Claude as judge.")
+    p = argparse.ArgumentParser(description="Label VoiceInk transcription samples using an LLM.")
     p.add_argument("--input", type=Path, default=DEFAULT_INPUT,
                    help=f"Input JSONL log file (default: {DEFAULT_INPUT})")
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
@@ -38,33 +44,51 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0,
                    help="Max samples to label (0 = all)")
     p.add_argument("--parallel", type=int, default=1,
-                   help="Number of parallel Claude CLI calls")
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help=f"Claude model to use (default: {DEFAULT_MODEL})")
+                   help="Number of parallel CLI calls")
+    add_provider_args(p)
     p.add_argument("--dry-run", action="store_true",
-                   help="Print prompts without calling Claude")
+                   help="Print prompts without calling the configured provider")
     p.add_argument("--longest", type=int, default=0,
                    help="Pick the N longest transcripts (by response length)")
     p.add_argument("--ids", nargs="*", default=None,
                    help="Label only these specific request IDs (prefix match)")
+    p.add_argument("--ids-file", type=Path, default=None,
+                   help="Read request IDs from a text file or JSONL manifest")
+    p.add_argument("--exclude-ids-file", type=Path, default=None,
+                   help="Exclude request IDs listed in a text file or JSONL manifest")
     p.add_argument("--force", action="store_true",
                    help="Re-label even if already labeled (use with --ids)")
     p.add_argument("--shuffle", action="store_true",
                    help="Randomize the order of entries before labeling")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Random seed used with --shuffle (default: 42)")
+    p.add_argument("--reference-labels", type=Path, default=None,
+                   help="Restrict calibration to IDs in this labeled JSONL and retain its label")
     return p.parse_args()
 
 
 def load_logs(path: Path) -> list[dict]:
     """Load and parse the proxy request log."""
     records = []
+    malformed = 0
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
             if record.get("request_json_valid") and record.get("response_json_valid"):
                 records.append(record)
+    if malformed:
+        print(
+            f"WARNING: skipped {malformed} malformed JSONL "
+            f"{'record' if malformed == 1 else 'records'} from {path}",
+            file=sys.stderr,
+        )
     return records
 
 
@@ -140,31 +164,49 @@ def build_prompt(record: dict, judge_template: str) -> str | None:
     )
 
 
-def call_claude(prompt: str, model: str) -> str:
-    """Call the Claude CLI and return the response text."""
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    env["CLAUDE_CODE_SKIP_UPDATE_CHECK"] = "1"
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
-    result = subprocess.run(
-        [
-            "claude",
-            "-p", prompt,
-            "--model", model,
-            "--disable-slash-commands",
-            "--allowed-tools", "",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=600,
-        env=env,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {result.stderr.strip()}")
-    return result.stdout.strip()
+def load_reference_labels(path: Path) -> dict[str, dict]:
+    """Load calibration references keyed by request ID."""
+    references = {}
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                if record.get("request_id") and record.get("label"):
+                    references[record["request_id"]] = record
+            except json.JSONDecodeError:
+                continue
+    return references
 
 
-def label_one(record: dict, model: str, dry_run: bool, judge_template: str) -> dict | None:
+def load_id_prefixes(path: Path) -> list[str]:
+    """Load request ID prefixes from newline text or a JSONL manifest."""
+    prefixes = []
+    seen = set()
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("{"):
+                try:
+                    prefix = str(json.loads(line)["request_id"]).strip()
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                    raise ValueError(
+                        f"Invalid ID manifest entry at {path}:{line_number}"
+                    ) from exc
+            else:
+                prefix = line
+            if prefix and prefix not in seen:
+                prefixes.append(prefix)
+                seen.add(prefix)
+    return prefixes
+
+
+def label_one(record: dict, provider: str, model: str, reasoning_effort: str,
+              dry_run: bool, judge_template: str,
+              reference: dict | None = None) -> dict | None:
     """Label a single record. Returns the labeled record or None on failure."""
     prompt = build_prompt(record, judge_template)
     if prompt is None:
@@ -177,24 +219,78 @@ def label_one(record: dict, model: str, dry_run: bool, judge_template: str) -> d
         return None
 
     try:
-        label = call_claude(prompt, model)
+        schema = LABEL_SCHEMA if provider == "codex" else None
+        raw = call_llm(
+            prompt,
+            provider=provider,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            output_schema=schema,
+            timeout=600,
+        )
+        label = parse_json_response(raw)["label"].strip() if schema else raw.strip()
+        if not label:
+            raise ValueError("provider returned an empty label")
     except Exception as exc:
         print(f"  ERROR [{record['request_id']}]: {exc}", file=sys.stderr)
         return None
 
-    return {
+    result = {
         "request_id": record["request_id"],
         "timestamp": record["timestamp"],
         "model_used_for_label": model,
+        "label_provider": provider,
+        "label_provider_metadata": provider_metadata(
+            provider, model, reasoning_effort
+        ),
         "original_model": record.get("model", ""),
         "raw_request_json": record.get("raw_request_json", ""),
         "original_response": record.get("response_text", ""),
         "label": label,
     }
+    if reference is not None:
+        result["reference_label"] = reference.get("label", "")
+        result["reference_model_used_for_label"] = reference.get(
+            "model_used_for_label", ""
+        )
+        result["reference_manually_reviewed"] = bool(
+            reference.get("manually_reviewed")
+        )
+    return result
 
 
 def main() -> None:
     args = parse_args()
+    model = resolve_model(args.provider, args.model)
+
+    if args.ids is not None and args.ids_file is not None:
+        print("Use only one of --ids or --ids-file", file=sys.stderr)
+        sys.exit(1)
+    id_prefixes = args.ids
+    if args.ids_file is not None:
+        if not args.ids_file.is_file():
+            print(f"ID file not found: {args.ids_file}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            id_prefixes = load_id_prefixes(args.ids_file)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(f"Loaded {len(id_prefixes)} request IDs from {args.ids_file}")
+    excluded_prefixes = []
+    if args.exclude_ids_file is not None:
+        if not args.exclude_ids_file.is_file():
+            print(f"Exclusion ID file not found: {args.exclude_ids_file}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            excluded_prefixes = load_id_prefixes(args.exclude_ids_file)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"Loaded {len(excluded_prefixes)} excluded request IDs "
+            f"from {args.exclude_ids_file}"
+        )
 
     if not args.input.exists():
         print(f"Input file not found: {args.input}", file=sys.stderr)
@@ -202,17 +298,36 @@ def main() -> None:
 
     logs = load_logs(args.input)
     print(f"Loaded {len(logs)} valid log entries from {args.input}")
+    if excluded_prefixes:
+        before = len(logs)
+        logs = [
+            record for record in logs
+            if not any(
+                record["request_id"].startswith(prefix)
+                for prefix in excluded_prefixes
+            )
+        ]
+        print(f"Excluded {before - len(logs)} entries from the calibration pool")
 
     dataset = LabeledDataset(args.output)
     labeled_ids = dataset.labeled_ids()
     if labeled_ids:
         print(f"Found {len(labeled_ids)} already-labeled entries in {args.output}")
 
+    references = None
+    if args.reference_labels:
+        if not args.reference_labels.is_file():
+            print(f"Reference labels not found: {args.reference_labels}", file=sys.stderr)
+            sys.exit(1)
+        references = load_reference_labels(args.reference_labels)
+        logs = [record for record in logs if record.get("request_id") in references]
+        print(f"Restricted calibration pool to {len(logs)} reference-labeled entries")
+
     # Filter by specific IDs (prefix match) -- skip dedup when --force is set
-    if args.ids:
+    if id_prefixes:
         pool = logs if args.force else [r for r in logs if r["request_id"] not in labeled_ids]
         to_label = [r for r in pool
-                    if any(r["request_id"].startswith(prefix) for prefix in args.ids)]
+                    if any(r["request_id"].startswith(prefix) for prefix in id_prefixes)]
         print(f"Filtered to {len(to_label)} entries matching --ids{' (force)' if args.force else ''}")
     else:
         to_label = [r for r in logs if r["request_id"] not in labeled_ids]
@@ -220,8 +335,8 @@ def main() -> None:
 
     # Shuffle entries
     if args.shuffle:
-        random.shuffle(to_label)
-        print("Shuffled entries randomly")
+        random.Random(args.seed).shuffle(to_label)
+        print(f"Shuffled entries with seed {args.seed}")
 
     # Pick the N longest by response text length
     if args.longest > 0:
@@ -238,7 +353,12 @@ def main() -> None:
         return
 
     # Read template once, pass to all workers
-    judge_template = JUDGE_PROMPT_PATH.read_text(encoding="utf-8")
+    prompt_path = provider_prompt_path(JUDGE_PROMPT_PATH, args.provider)
+    if not prompt_path.is_file():
+        print(f"Provider prompt not found: {prompt_path}", file=sys.stderr)
+        sys.exit(1)
+    judge_template = prompt_path.read_text(encoding="utf-8")
+    print(f"Using {args.provider} prompt: {prompt_path}")
 
     labeled_count = 0
     error_count = 0
@@ -246,7 +366,11 @@ def main() -> None:
     if args.parallel <= 1:
         for i, record in enumerate(to_label, 1):
             print(f"[{i}/{len(to_label)}] Labeling {record['request_id']}...")
-            result = label_one(record, args.model, args.dry_run, judge_template)
+            reference = references.get(record["request_id"]) if references else None
+            result = label_one(
+                record, args.provider, model, args.reasoning_effort,
+                args.dry_run, judge_template, reference,
+            )
             if result:
                 dataset.save(result)
                 labeled_count += 1
@@ -255,7 +379,11 @@ def main() -> None:
     else:
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
             futures = {
-                pool.submit(label_one, record, args.model, args.dry_run, judge_template): record
+                pool.submit(
+                    label_one, record, args.provider, model,
+                    args.reasoning_effort, args.dry_run, judge_template,
+                    references.get(record["request_id"]) if references else None,
+                ): record
                 for record in to_label
             }
             for i, future in enumerate(as_completed(futures), 1):

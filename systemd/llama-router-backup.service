@@ -1,0 +1,7 @@
+[Unit]
+Description=Back up VoiceInk annotation and MLflow state
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/thomas/srv/llama-router
+ExecStart=/home/thomas/srv/llama-router/bin/backup-state.sh
