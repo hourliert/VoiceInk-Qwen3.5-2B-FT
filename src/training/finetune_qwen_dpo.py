@@ -352,7 +352,7 @@ def main() -> None:
             "precompute_ref_log_probs": args.precompute_ref_log_probs,
             "precompute_ref_batch_size": args.precompute_ref_batch_size,
             "torch_empty_cache_steps": args.torch_empty_cache_steps,
-            "output_dir": args.output_dir,
+            "voiceink_output_dir": args.output_dir,
             "lora_dir": args.lora_dir,
             "gguf_base": args.gguf_base,
             "gguf_quantizations": args.export_gguf or [],

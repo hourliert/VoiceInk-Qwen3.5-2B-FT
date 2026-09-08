@@ -2007,11 +2007,13 @@ wheels = [
 
 [[package]]
 name = "torchao"
-version = "0.18.0"
+version = "0.13.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/55/ed9ad98f0f09d5a1124d09830043d13a39e63539f9590d2bdb6d71cbc4a4/torchao-0.18.0-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6540b148e40ba81cbd4de86392225a076a1591146e9cebb099b3b234ba9feebe", size = 3372585, upload-time = "2026-08-03T19:43:10.993Z" },
-    { url = "https://files.pythonhosted.org/packages/c4/4d/485477bb8f05bd501016059c6d8abd742f830cb1b24ab7704e086c7cc35a/torchao-0.18.0-py3-none-any.whl", hash = "sha256:5c2b4485341bf28b7fed2c4fc95b9f298e209f41685350f067de85527a05585e", size = 1369798, upload-time = "2026-08-03T19:43:12.649Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/f3/5f652941cbc7d07f1d40bcfb7263919a4994f318e1cf7be45cf2b6107d46/torchao-0.13.0-1-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:718568b158af481fdd6220165d3e336b7789ad8900ac40a07bf2212505e84491", size = 6927763, upload-time = "2025-09-04T14:52:13.869Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/1b/ae70db198ef86b36834901229330a38709c39807ae70ae833e7237195810/torchao-0.13.0-1-py3-none-any.whl", hash = "sha256:15afa4c946b251c22004cc4c095670092094da0b1329223ff413552c4070aae6", size = 1025992, upload-time = "2025-09-04T14:52:15.336Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/0d/1d9d26ba3397e19a30c6111d393dfdeb95b3eb33913d17de802ee8d83e6f/torchao-0.13.0-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0773c0e74e16b1fe50953596fb24faf40a056c654b6da8a440934af6ead95936", size = 6927472, upload-time = "2025-09-03T13:48:45.202Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/32/43bbd27cd5aa6b5bb6dbf46d4cfe2757814b023394279c446eeaba9c1f63/torchao-0.13.0-py3-none-any.whl", hash = "sha256:d27a1ca3569d95791ab4d0a0f75507606aaca984485e77ae7116179423bf2e01", size = 1025742, upload-time = "2025-09-03T13:48:46.519Z" },
 ]
 
 [[package]]
@@ -2214,7 +2216,6 @@ dependencies = [
     { name = "wheel" },
     { name = "xformers", marker = "(platform_machine == 'AMD64' and 'linux' in sys_platform) or (platform_machine == 'x86_64' and 'linux' in sys_platform) or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fd/35/b09e55ffd89462ede8d52b6f1d711002079043f73b5a36dd7e6e97a1ee5d/unsloth-2026.8.7.tar.gz", hash = "sha256:d6cd2e814441004d9b0c73202017ff86f27352be7ece0eacc68fc355c5dcca88", size = 85499433, upload-time = "2026-08-06T15:48:34.199Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f6/6a/b2b59d16f9136e2761b1c879e57f97f62ea7aa437f11477927076e39001f/unsloth-2026.8.7-py3-none-any.whl", hash = "sha256:fb3f42f9848d51145c8209e7f5ff78329d335c893c7c8702f41ba90d15c1c088", size = 80510474, upload-time = "2026-08-06T15:48:29.554Z" },
 ]
@@ -2291,6 +2292,7 @@ dependencies = [
     { name = "nvidia-ml-py" },
     { name = "peft" },
     { name = "torch" },
+    { name = "torchao" },
     { name = "transformers" },
     { name = "trl" },
     { name = "unsloth" },
@@ -2306,6 +2308,7 @@ requires-dist = [
     { name = "nvidia-ml-py", specifier = ">=13.590.44" },
     { name = "peft", specifier = "==0.18.1" },
     { name = "torch", specifier = "==2.8.0" },
+    { name = "torchao", specifier = "==0.13.0" },
     { name = "transformers", specifier = "==5.2.0" },
     { name = "trl", specifier = "==0.22.2" },
     { name = "unsloth", specifier = "==2026.8.7" },

@@ -427,7 +427,7 @@ def main(argv=None) -> None:
             "save_steps": args.save_steps,
             "load_best_model_at_end": args.load_best_model_at_end,
             "dataset_snapshot": dataset_snapshot or "",
-            "output_dir": args.output_dir,
+            "voiceink_output_dir": args.output_dir,
             "lora_dir": args.lora_dir,
             "gguf_base": args.gguf_base,
             "gguf_quantizations": args.export_gguf or [],

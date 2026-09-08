@@ -11,6 +11,7 @@ dependencies = [
   "nvidia-ml-py>=13.590.44",
   "peft==0.18.1",
   "torch==2.8.0",
+  "torchao==0.13.0",
   "transformers==5.2.0",
   "trl==0.22.2",
   "unsloth==2026.8.7",
