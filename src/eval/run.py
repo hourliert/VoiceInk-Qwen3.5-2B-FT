@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from data.manifest import load_manifest, split_path  # noqa: E402
+from eval.suites import load_suite  # noqa: E402
 
 
 def resolved_command(args: argparse.Namespace) -> list[str]:
@@ -30,21 +31,31 @@ def resolved_command(args: argparse.Namespace) -> list[str]:
         "--parallel", str(args.parallel), "--llama-host", args.llama_host,
         "--llama-port", str(args.llama_port),
     ]
+    if args.include_regression and args.suite:
+        raise ValueError("--suite and --include-regression are mutually exclusive")
     if args.include_regression:
         return [
             sys.executable, str(ROOT / "src/eval/strict.py"), "run", *common,
             "--output-dir", str(args.output_dir),
             "--report", str(args.output_dir / "promotion-evidence.json"),
         ]
-    acceptance = split_path(args.release_manifest, manifest, "acceptance")
+    if args.suite:
+        suite = load_suite(args.suite)
+        eval_data = Path(suite["data"]["resolved_path"])
+        suite_name = suite["name"]
+        rubric = suite["rubric"]
+    else:
+        eval_data = split_path(args.release_manifest, manifest, "acceptance")
+        suite_name = "acceptance-150"
+        rubric = "strict-v3"
     comparison_dir = (
-        args.output_dir / f"{args.candidate}-vs-{args.baseline}" / "acceptance-150"
+        args.output_dir / f"{args.candidate}-vs-{args.baseline}" / suite_name
     )
     return [
         sys.executable, str(ROOT / "src/eval/evaluate.py"),
         "--baseline", args.baseline, "--candidate", args.candidate,
-        "--eval-data", str(acceptance), "--allow-noncanonical-eval",
-        "--judge-provider", "codex", "--judge-rubric", "strict-v3",
+        "--eval-data", str(eval_data), "--allow-noncanonical-eval",
+        "--judge-provider", "codex", "--judge-rubric", rubric,
         "--judge-model", args.judge_model,
         "--judge-reasoning-effort", args.judge_reasoning_effort,
         "--parallel", str(args.parallel), "--llama-host", args.llama_host,
@@ -58,6 +69,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--release-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--suite", choices=["engineering-100"],
+        help="Run a sealed named diagnostic suite instead of release acceptance",
+    )
     parser.add_argument(
         "--include-regression", action="store_true",
         help="Run the optional locked 440 regression suite and final promotion gate",
@@ -75,7 +90,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     command = resolved_command(args)
-    mode = "acceptance + final regression" if args.include_regression else "acceptance only"
+    mode = (
+        "acceptance + final regression" if args.include_regression
+        else f"sealed suite {args.suite}" if args.suite
+        else "acceptance only"
+    )
     print(f"VoiceInk release evaluation: {mode}")
     print(f"  Release: {args.release_manifest}")
     print(f"  Baseline: {args.baseline}")

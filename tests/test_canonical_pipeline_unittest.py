@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from data.consolidate_release import consolidate_rows, fingerprint
 from data.legacy_layout import apply_plan, build_plan
 from data.manage import BOOTSTRAP_SPEC, EXPECTED_SPLITS, select_bootstrap
 from data.manifest import canonical_json, load_manifest, sha256_file
@@ -67,6 +68,34 @@ def release(root):
 
 
 class CanonicalPipelineTests(unittest.TestCase):
+    def test_consolidation_excludes_holdouts_and_reviewed_labels_override_legacy(self):
+        def row(raw, label):
+            return {"messages": [
+                {"role": "user", "content": f"<TRANSCRIPT>{raw}</TRANSCRIPT>"},
+                {"role": "assistant", "content": label},
+            ]}
+
+        legacy = [
+            row("Keep me", "legacy"),
+            row("  KEEP   ME  ", "duplicate"),
+            row("Replace me", "old label"),
+            row("Holdout", "must be excluded"),
+        ]
+        reviewed = [row("replace me", "reviewed label"), row("New sample", "new")]
+        rows, report = consolidate_rows(
+            legacy, reviewed, {fingerprint(row("holdout", "ignored"))}
+        )
+
+        self.assertEqual(len(rows), 3)
+        labels = {fingerprint(item): item["messages"][-1]["content"] for item in rows}
+        self.assertEqual(labels[fingerprint(row("replace me", "ignored"))], "reviewed label")
+        self.assertEqual(report, {
+            "legacy_duplicates_removed": 1,
+            "legacy_holdout_rows_removed": 1,
+            "reviewed_replacements": 1,
+            "reviewed_additions": 1,
+        })
+
     def test_bootstrap_selection_has_exact_fixed_shape(self):
         rows = []
         index = 0

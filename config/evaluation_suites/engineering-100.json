@@ -1,0 +1,33 @@
+{
+  "schema": "voiceink.evaluation-suite/v1",
+  "name": "engineering-100",
+  "sealed": true,
+  "purpose": "Unbiased diagnostic comparison on V3 engineering holdouts unseen by all declared models.",
+  "rubric": "strict-v3",
+  "data": {
+    "path": "../../datasets/legacy/qwen35-2b-voiceink-v3/eval-engineering-100.jsonl",
+    "records": 100,
+    "sha256": "ff982439c40659117bb825a148df8ec0629570150fdb96cb4a75456411e81cd1"
+  },
+  "training_exclusions": [
+    {
+      "name": "Qwen3.5-2B-VoiceInk-v3",
+      "path": "../../datasets/legacy/qwen35-2b-voiceink-v3/train.jsonl",
+      "sha256": "0e2c9024f215d4d83953e8de7439283d12a3a8c58a284f77773d0a36e07f1e4e",
+      "expected_overlap": 0
+    },
+    {
+      "name": "Qwen3.5-2B-VoiceInk-v4-candidate",
+      "path": "../../datasets/releases/voiceink-data-v2/train.jsonl",
+      "sha256": "17e7fb1186b6102b74abfe3a39fa347bc5fd7dbd5bd66d6310a876812cd3fa08",
+      "expected_overlap": 0
+    },
+    {
+      "name": "voiceink-data-v1 clean corpus (R1 and clean-v1-2ep)",
+      "path": "../../datasets/releases/voiceink-data-v1/train.jsonl",
+      "sha256": "d8bc2e5da2047dfa73b2b4ce6eb9c111ffcf06d1a578c62280ad2e614cf1a005",
+      "expected_overlap": 0
+    }
+  ],
+  "content_sha256": "d81bab253fcb4c2eabf306fe46944ad044ada977be336526566751abb1ff2e92"
+}

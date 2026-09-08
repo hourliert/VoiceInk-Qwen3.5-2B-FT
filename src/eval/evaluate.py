@@ -745,6 +745,7 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
         b_avg, c_avg,
         {d: sum(v) / len(v) for d, v in per_dim_baseline.items()},
         {d: sum(v) / len(v) for d, v in per_dim_candidate.items()},
+        overall_p,
     )
 
     summary = {
@@ -798,8 +799,8 @@ def aggregate(judgments: list[dict], baseline_outputs: list[dict],
     return summary
 
 
-def determine_winner(b_avg, c_avg, b_dims, c_dims):
-    """Determine winner with critical dimension checks."""
+def determine_winner(b_avg, c_avg, b_dims, c_dims, overall_p=None):
+    """Report practical wins separately from statistically significant edges."""
     for dim in ("meaning_preservation", "instruction_following"):
         if c_dims[dim] < 3.0 <= b_dims[dim]:
             return "baseline", f"Candidate fails critical dimension: {dim}"
@@ -808,6 +809,12 @@ def determine_winner(b_avg, c_avg, b_dims, c_dims):
 
     diff = abs(b_avg - c_avg)
     if diff < 2.0:
+        if overall_p is not None and overall_p < 0.05 and b_avg != c_avg:
+            leader = "candidate" if c_avg > b_avg else "baseline"
+            return f"{leader}_edge", (
+                f"Statistically significant {leader} edge, below the 2-point "
+                f"practical margin (baseline={b_avg}, candidate={c_avg})"
+            )
         return "tie", f"Scores within margin (baseline={b_avg}, candidate={c_avg})"
     elif c_avg > b_avg:
         return "candidate", f"Candidate wins {c_avg} vs {b_avg} (+{round(c_avg - b_avg, 1)})"

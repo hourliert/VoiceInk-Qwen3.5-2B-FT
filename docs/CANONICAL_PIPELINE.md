@@ -49,6 +49,23 @@ The CLI equivalent is:
   datasets/releases/voiceink-data-v1/manifest.json
 ```
 
+To train a breadth-matched successor to the historical V3 model, consolidate
+its replay corpus with the reviewed release. Matching raw transcripts are
+deduplicated after Unicode/case/whitespace normalization, reviewed labels
+replace legacy labels, and validation, acceptance, and the locked 440 are
+excluded from training by construction:
+
+```bash
+.venv/bin/python3 src/data/consolidate_release.py voiceink-data-v2
+.venv/bin/python3 src/data/manage.py verify \
+  datasets/releases/voiceink-data-v2/manifest.json
+```
+
+The sealed `consolidation-report.json` records removals, replacements, and new
+additions. The 150 validation and 150 acceptance samples are copied unchanged,
+so the first comparison remains diagnostic; because historical V3 trained on
+those samples, it is not unbiased promotion evidence.
+
 Release directories are immutable and contain fingerprinted Qwen text-block and
 LFM plain-text representations for each split, plus a signed `manifest.json`.
 Both representations have identical sample IDs and lineage. Training never consumes
@@ -64,9 +81,9 @@ All new jobs require a release manifest:
 ```bash
 .venv/bin/python3 src/training/train.py sft \
   --profile qwen35-2b-sft \
-  --release-manifest datasets/releases/voiceink-data-v1/manifest.json \
-  --version v2 \
-  --export-gguf q4_k_m q8_0
+  --release-manifest datasets/releases/voiceink-data-v2/manifest.json \
+  --version voiceink-data-v2 \
+  --export-gguf q4_k_m
 ```
 
 Use `--check-only` for a full trainer preflight or `--print-command` to inspect
@@ -126,6 +143,20 @@ Start with the release's sealed 150-sample acceptance split:
 
 The release-aware entry point resolves the acceptance file, expected count,
 strict-v3 rubric, and Codex/Luna provider. It does not run the historical 440.
+
+For a fair diagnostic against historical V3, whose training corpus contains the
+current acceptance 150, use the sealed engineering holdout. The launcher verifies
+its fingerprint, 100 unique rows, and zero transcript overlap with both V3 and V2
+training data before inference:
+
+```bash
+.venv/bin/python3 src/eval/run.py \
+  --baseline Qwen3.5-2B-VoiceInk-v3 \
+  --candidate Qwen3.5-2B-VoiceInk-v4-candidate \
+  --release-manifest datasets/releases/voiceink-data-v2/manifest.json \
+  --suite engineering-100 \
+  --parallel 10
+```
 
 Once a candidate is promising, add `--include-regression` to the same command
 for the final promotion gate. That opt-in run adds the locked 440-sample
