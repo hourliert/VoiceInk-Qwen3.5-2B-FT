@@ -18,6 +18,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 .venv/
+.venv-vllm/
 venv/
 
 # Logs
@@ -68,6 +69,11 @@ models/Qwen3.8-2B-VoiceInk-v1*/
 # Eval results
 results/
 
+# Frontend build and dependencies
+ui/node_modules/
+ui/test-results/
+src/control_plane/static/
+
 # Editor / OS
 .vscode/
 .idea/
@@ -93,3 +99,5 @@ training/canonical/
 training/backups/
 config/production-model.json
 /training/
+
+ui/*.tsbuildinfo

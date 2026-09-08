@@ -19,7 +19,7 @@ model_root = "models/canonical/Qwen3.8-2B-VoiceInk"
 [profiles.qwen35-2b-sft]
 mode = "sft"
 trainer = "qwen"
-base_model = "models/Qwen3.5-2B"
+base_model = "unsloth/Qwen3.5-2B"
 max_seq_length = 16384
 lora_r = 32
 lora_alpha = 64

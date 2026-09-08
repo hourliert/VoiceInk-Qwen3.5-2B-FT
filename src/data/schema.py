@@ -1,10 +1,10 @@
-"""Schema v2 for canonical VoiceInk data cohorts and immutable releases."""
+"""Additive schema for canonical VoiceInk data and control-plane operations."""
 
 from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS canonical_cohorts (
@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS canonical_cohort_members (
 );
 CREATE INDEX IF NOT EXISTS canonical_cohort_split_idx
 ON canonical_cohort_members(cohort_id, split, stratum);
+CREATE INDEX IF NOT EXISTS analyses_request_created_idx
+ON analyses(request_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS jobs_request_id_idx
+ON jobs(request_id, id DESC);
+CREATE INDEX IF NOT EXISTS annotations_request_origin_created_idx
+ON annotations(request_id, origin, created_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS canonical_releases (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -60,11 +66,33 @@ CREATE TABLE IF NOT EXISTS model_promotions (
     promoted_at TEXT NOT NULL,
     UNIQUE(model_name, model_version)
 );
+CREATE TABLE IF NOT EXISTS ingestion_cursors (
+    source_path TEXT PRIMARY KEY,
+    source_inode INTEGER NOT NULL,
+    byte_offset INTEGER NOT NULL DEFAULT 0,
+    line_number INTEGER NOT NULL DEFAULT 0,
+    imported_records INTEGER NOT NULL DEFAULT 0,
+    malformed_records INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS maintenance_jobs (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('pending','running','completed','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS maintenance_jobs_state_idx
+ON maintenance_jobs(state, id);
 """
 
 
 def migrate(connection: sqlite3.Connection) -> None:
-    """Apply additive schema-v2 objects without rewriting private records."""
+    """Apply additive schema objects without rewriting private records."""
     connection.executescript(SCHEMA)
     connection.execute(
         "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('canonical_version',?)",

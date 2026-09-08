@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS annotations (
     UNIQUE(request_id, text_sha256, origin, provider, model, prompt_sha256)
 );
 CREATE INDEX IF NOT EXISTS annotations_request_idx ON annotations(request_id, id);
+CREATE INDEX IF NOT EXISTS annotations_request_origin_created_idx
+ON annotations(request_id, origin, created_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS annotation_sources (
     annotation_id INTEGER NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
     source_file_id INTEGER NOT NULL REFERENCES source_files(id) ON DELETE CASCADE,
@@ -171,6 +173,8 @@ CREATE TABLE IF NOT EXISTS analyses (
     raw_result_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS analyses_request_created_idx
+ON analyses(request_id, created_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY,
     request_id TEXT NOT NULL REFERENCES samples(request_id) ON DELETE CASCADE,
@@ -198,6 +202,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_state_idx ON jobs(state, id);
+CREATE INDEX IF NOT EXISTS jobs_request_id_idx ON jobs(request_id, id DESC);
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY,
     event_type TEXT NOT NULL,
@@ -230,23 +235,50 @@ class AnnotationStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self.connection = sqlite3.connect(
-            path, timeout=30, check_same_thread=False, isolation_level=None
-        )
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self.connection.execute("PRAGMA journal_mode = WAL")
-        self.connection.execute("PRAGMA busy_timeout = 30000")
+        self._connections_lock = threading.Lock()
+        self._connections: list[sqlite3.Connection] = []
+        self._local = threading.local()
+        self._closed = False
+        connection = self._new_connection()
+        self._local.connection = connection
         with self._lock:
-            self.connection.executescript(SCHEMA)
-            self.connection.execute(
+            connection.executescript(SCHEMA)
+            connection.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
                 (str(SCHEMA_VERSION),),
             )
 
+    def _new_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.path, timeout=30, check_same_thread=False, isolation_level=None
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA cache_size = -16384")
+        connection.execute("PRAGMA mmap_size = 134217728")
+        with self._connections_lock:
+            if self._closed:
+                connection.close()
+                raise RuntimeError("AnnotationStore is closed")
+            self._connections.append(connection)
+        return connection
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            connection = self._new_connection()
+            self._local.connection = connection
+        return connection
+
     def close(self) -> None:
-        with self._lock:
-            self.connection.close()
+        with self._connections_lock:
+            self._closed = True
+            connections, self._connections = self._connections, []
+        for connection in connections:
+            connection.close()
 
     def integrity_check(self) -> str:
         with self._lock:
@@ -285,7 +317,10 @@ class AnnotationStore:
 
     def import_proxy_record(self, record: dict, *, source_file_id: int | None = None,
                             source_line: int | None = None) -> bool:
-        from common.extract import extract_components
+        try:
+            from common.extract import extract_components
+        except ModuleNotFoundError:
+            from src.common.extract import extract_components
 
         request_id = str(record.get("request_id", "")).strip()
         raw_request = str(record.get("raw_request_json", ""))
@@ -545,13 +580,14 @@ class AnnotationStore:
         return row
 
     def recent(self, limit: int = 10) -> list[dict]:
+        bounded_limit = min(max(limit, 1), 50)
         with self._lock:
             return [dict(row) for row in self.connection.execute(
                 "SELECT s.request_id,s.timestamp,s.transcript,s.production_model,s.production_output,"
                 "s.duration_ms,d.outcome,d.training_eligible,j.state AS job_state "
                 "FROM samples s LEFT JOIN decisions d ON d.request_id=s.request_id AND d.is_current=1 "
                 "LEFT JOIN jobs j ON j.id=(SELECT id FROM jobs WHERE request_id=s.request_id "
-                "ORDER BY id DESC LIMIT 1) ORDER BY s.timestamp DESC LIMIT ?", (limit,)
+                "ORDER BY id DESC LIMIT 1) ORDER BY s.timestamp DESC LIMIT ?", (bounded_limit,)
             )]
 
     def history(self, *, query: str = "", status: str = "", limit: int = 50,

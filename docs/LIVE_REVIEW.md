@@ -1,6 +1,6 @@
-# VoiceInk Live Review
+# VoiceInk Review Workflow
 
-The live review website turns recent production mistakes into durable,
+The Review section of the VoiceInk Control Plane turns recent production mistakes into durable,
 human-approved training labels while the surrounding context is still fresh.
 It is available at `http://192.168.1.150:8003` and is started automatically by
 `bin/start.sh` alongside llama-server and the VoiceInk proxy.
@@ -11,8 +11,8 @@ and screen OCR to devices that can reach the LAN address.
 ## Daily workflow
 
 The Recent page shows the ten latest successful proxy requests. Opening a row
-queues two independent ephemeral Codex CLI calls using `gpt-5.6-luna` at low
-reasoning effort:
+queues two independent ephemeral Codex CLI calls using `gpt-5.6-luna` at
+`xhigh` reasoning effort by default:
 
 1. the labeler creates the proposed gold cleanup;
 2. the reference-free evaluator validates that proposal and blindly compares it
@@ -29,8 +29,9 @@ Choose one final outcome:
 - **Production Was Correct** approves the production response as the label;
 - **Exclude** records the review but prevents training use.
 
-Every decision refreshes the approved JSONL export, mirrors the append-only
-audit log, and makes an online SQLite backup.
+Every decision commits immediately to SQLite and schedules a durable maintenance
+outbox job. A background worker refreshes the approved JSONL export, mirrors the
+append-only audit log, and makes an online SQLite backup without delaying the UI.
 
 ## Durable data
 
@@ -89,12 +90,15 @@ never starts a training run automatically.
 
 ## Manual launch
 
-For debugging without MLflow:
+For an isolated debugging instance, build the React bundle and use a non-production port:
 
 ```bash
-.venv/bin/python3 src/labeling/live_review_server.py \
-  --host 192.168.1.150 --port 8003 --no-mlflow
+npm --prefix ui run build
+.venv/bin/python3 src/control_plane/server.py \
+  --host 127.0.0.1 --port 18003 --no-mlflow
 ```
 
-In normal operation, start or restart `llama-router.service`; `bin/start.sh`
-supervises llama-server, the proxy, and this website as one stack.
+The former `live_review_server.py` UI is legacy worker infrastructure, not the
+production website. In normal operation, start or restart
+`llama-router.service`; `bin/start.sh` supervises llama-server, the proxy,
+MLflow, and this control plane as one stack.

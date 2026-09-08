@@ -71,7 +71,9 @@ def load_manifest(path: Path, *, require_complete: bool = True) -> dict[str, Any
     task = manifest.get("task", "sft")
     if task == "sft":
         default_representation = "text-blocks"
-        expected_counts: dict[str, int | None] = REQUIRED_SPLITS
+        expected_counts: dict[str, int | None] = manifest.get(
+            "expected_splits", REQUIRED_SPLITS
+        )
     elif task == "preference":
         default_representation = "preference"
         expected_counts = {"train": None, "validation": None}

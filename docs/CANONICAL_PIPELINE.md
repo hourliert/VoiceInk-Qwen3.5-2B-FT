@@ -26,13 +26,21 @@ long (180), and no-op (120). The historical 440 is excluded and remains a
 regression benchmark only. Synthetic examples are excluded from the bootstrap;
 future releases may include at most 90, only in train.
 
-Opening a bootstrap item in the live-review site's **Bootstrap Queue** starts
-fresh Luna labeling and independent evaluation. A release remains blocked until
-all 1,200 have a fresh Luna analysis, all 150 acceptance items have a fresh
-human decision, every material/uncertain/conflicting item is reviewed, the 10%
-deterministic audit is complete, and critical errors are resolved.
+Opening a bootstrap item in the control plane Review queue starts
+fresh Luna labeling and independent evaluation. A release remains blocked until all 1,200 have a fresh Luna analysis, the
+2% deterministic audit is complete, and genuinely ambiguous or unsafe proposal
+cases are reviewed. High-confidence production wins keep the existing approved
+label; high-confidence, validation-passing Luna wins are selected automatically
+even when material. Passing ties and non-material, validation-passing comparisons also retain the existing approved cohort label. Fresh human decisions always take precedence.
 
-After review:
+After review, the preferred path is **Control plane → Data → Cohorts →
+voiceink-bootstrap-v1**. The preview freezes all current human-reviewed
+corrections made outside the cohort since cohort creation as an explicit
+train-only delta. Validation (150), acceptance (150), and the locked 440 stay
+unchanged. Enter a release name and seal it; creation fails if the selection
+changed since the preview.
+
+The CLI equivalent is:
 
 ```bash
 .venv/bin/python3 src/data/manage.py release \
@@ -44,7 +52,10 @@ After review:
 Release directories are immutable and contain fingerprinted Qwen text-block and
 LFM plain-text representations for each split, plus a signed `manifest.json`.
 Both representations have identical sample IDs and lineage. Training never consumes
-acceptance; checkpoint selection uses validation only.
+acceptance; checkpoint selection uses validation only. The manifest records the
+correction cutoff, exact request and annotation IDs, expected split counts, and
+selection SHA-256. The release page displays the manifest and copyable Qwen3.5
+2B preflight/full-run commands.
 
 ## Training
 
@@ -52,7 +63,7 @@ All new jobs require a release manifest:
 
 ```bash
 .venv/bin/python3 src/training/train.py sft \
-  --profile qwen38-2b-sft \
+  --profile qwen35-2b-sft \
   --release-manifest datasets/releases/voiceink-data-v1/manifest.json \
   --version v2 \
   --export-gguf q4_k_m q8_0

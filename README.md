@@ -50,8 +50,10 @@ The fine-tuned model runs at ~250 tokens/second on a single RTX 4080 Super, outp
 
 - **Host machine**: Remote gaming PC (RTX 4080 Super, 16GB VRAM) running Linux, accessible from the Mac over the network.
 - **LLM backend**: [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-server`) on port 8002, serving multiple Qwen 3.5 model variants via an OpenAI-compatible API.
-- **Reverse proxy**: A lightweight Python proxy (`src/voiceink_proxy/server.py`) on port 8001 that forwards VoiceInk requests to llama-server and logs every request/response pair as JSONL for training data collection.
-- **Startup**: `bin/start.sh` launches llama-server, the proxy, live review, and MLflow. A systemd unit (`systemd/llama-router.service`) runs the stack on boot.
+- **Reverse proxy**: A lightweight Python proxy (`src/voiceink_proxy/server.py`) on port 8001 that forwards VoiceInk requests to llama-server and appends every request/response pair to JSONL.
+- **Control plane**: A React + TypeScript application backed by the Python API on port 8003. A crash-safe cursor ingests the proxy JSONL into the authoritative SQLite registry; ten Luna workers and a durable maintenance outbox operate independently of HTTP reads.
+- **Experiment tracking**: MLflow on port 5000 remains the source of truth for training/evaluation runs, metrics, prompts, artifacts, and model lineage.
+- **Startup**: `bin/start.sh` builds the local Vite bundle and launches llama-server, the proxy, the VoiceInk control plane, and MLflow. A systemd unit (`systemd/llama-router.service`) runs the same stack on boot.
 
 ## The fine-tuning pipeline
 
@@ -164,7 +166,7 @@ python3 src/labeling/review_server.py \
   --input datasets/labeled.jsonl --ids-file datasets/review.jsonl
 ```
 
-The production live-review site is started with the router at `http://192.168.1.150:8003`; see [the live-review guide](docs/LIVE_REVIEW.md). For the separate batch reviewer above, browse to `http://<machine-LAN-IP>:8004` when binding to `0.0.0.0`. The
+The VoiceInk Control Plane is started with the router at `http://192.168.1.150:8003`; see [the control-plane guide](docs/CONTROL_PLANE.md) and [the review workflow](docs/LIVE_REVIEW.md). For the separate batch reviewer above, browse to `http://<machine-LAN-IP>:8004` when binding to `0.0.0.0`. The
 review server has no authentication, so expose it only on a trusted local
 network. Automatic approvals are stored as `auto_review`; only UI decisions
 are stored as `manual_review`. Approve and Save Edit make a record eligible
