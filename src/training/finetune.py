@@ -435,7 +435,7 @@ def main(argv=None) -> None:
         datasets=[
             dataset_metadata("train", args.train, len(train_data)),
             *(
-                [dataset_metadata("training_regression_eval", args.eval, len(eval_data))]
+                [dataset_metadata("validation", args.eval, len(eval_data))]
                 if eval_data is not None else []
             ),
         ],
@@ -611,7 +611,7 @@ def main(argv=None) -> None:
             **trainer_stats.metrics,
             "best_eval_loss": trainer.state.best_metric,
         },
-        dataset_role="training_regression_eval",
+        dataset_role="validation",
     )
     tracking.finish()
     print("\nDone!")

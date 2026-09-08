@@ -849,7 +849,7 @@ def log_mlflow_comparison(tracking, args, summary: dict) -> None:
             },
             tags={"voiceink.comparison_role": role},
             metrics=_model_metrics(summary, role),
-            dataset_role="full_quality_eval",
+            dataset_role="evaluation",
         )
     tracking.set_tags({
         f"voiceink.{role}_logged_model_id": model_id
@@ -1136,7 +1136,7 @@ def main() -> None:
             "saved_outputs": args.outputs or "",
             "output_dir": args.output_dir,
         },
-        datasets=[dataset_metadata("full_quality_eval", args.eval_data, len(load_eval_data(args.eval_data)))],
+        datasets=[dataset_metadata("evaluation", args.eval_data, len(load_eval_data(args.eval_data)))],
         tags={
             "voiceink.baseline_model": args.baseline,
             "voiceink.candidate_model": args.candidate,

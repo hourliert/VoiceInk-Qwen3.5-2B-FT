@@ -250,9 +250,11 @@ class ControlPlaneState:
 
     def runs(self, category: str = "all", limit: int = 30) -> dict[str, Any]:
         experiments = {
+            "data": ["voiceink-data"],
+            "labeling": ["voiceink-labeling"],
             "training": ["voiceink-training"],
-            "evaluations": ["voiceink-evaluation", "voiceink-benchmarks"],
-            "all": ["voiceink-training", "voiceink-evaluation", "voiceink-benchmarks"],
+            "evaluations": ["voiceink-evaluation"],
+            "all": ["voiceink-data", "voiceink-labeling", "voiceink-training", "voiceink-evaluation"],
         }.get(category, ["voiceink-training", "voiceink-evaluation"])
         result: list[dict] = []
         errors = []
@@ -345,4 +347,3 @@ class ControlPlaneState:
             "latest_release": releases[0] if releases else None,
             "production_model": recent[0]["production_model"] if recent else "",
         }
-

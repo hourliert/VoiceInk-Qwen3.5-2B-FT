@@ -19,6 +19,24 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TRACKING_URI = os.environ.get(
     "MLFLOW_TRACKING_URI", "http://192.168.1.150:5000"
 )
+EXPERIMENT_DATA = "voiceink-data"
+EXPERIMENT_LABELING = "voiceink-labeling"
+EXPERIMENT_TRAINING = "voiceink-training"
+EXPERIMENT_EVALUATION = "voiceink-evaluation"
+
+
+def run_domain(run_kind: str) -> str:
+    """Return the stable lifecycle domain encoded by a run kind."""
+    return run_kind.split(".", 1)[0]
+
+
+def mlflow_experience(run_kind: str) -> str:
+    """Map VoiceInk work onto MLflow's two UI experiences."""
+    return (
+        "model-training"
+        if run_domain(run_kind) in {"data", "training", "promotion"}
+        else "genai"
+    )
 
 
 def add_mlflow_args(
@@ -46,6 +64,11 @@ def add_mlflow_args(
         "--mlflow-run-id",
         default=None,
         help="Resume and enrich an existing MLflow run instead of creating one",
+    )
+    parser.add_argument(
+        "--mlflow-parent-run-id",
+        default=None,
+        help="Attach this run beneath an existing orchestration run",
     )
     parser.add_argument(
         "--no-mlflow",
@@ -280,7 +303,6 @@ class MlflowRun:
                 dataset=self._datasets_by_role.get(dataset_role),
                 synchronous=True,
             )
-        self.set_tags({"voiceink.logged_model_id": model.model_id})
         return model.model_id
 
     def finish(self, status: str = "FINISHED") -> None:
@@ -332,6 +354,9 @@ def start_mlflow_run(
         run_kind.startswith("training.") and run_kind != "training.backfill"
     )
     requested_run_id = getattr(args, "mlflow_run_id", None)
+    parent_run_id = getattr(args, "mlflow_parent_run_id", None)
+    if requested_run_id and parent_run_id:
+        raise RuntimeError("--mlflow-run-id and --mlflow-parent-run-id are mutually exclusive")
     if requested_run_id:
         if active is not None:
             raise RuntimeError("--mlflow-run-id cannot be used inside an active MLflow run")
@@ -340,6 +365,7 @@ def start_mlflow_run(
         run = mlflow.start_run(
             run_name=resolved_name,
             nested=active is not None,
+            parent_run_id=parent_run_id if active is None else None,
             description=(
                 f"VoiceInk {run_kind}; private rows and local model binaries are not uploaded."
             ),
@@ -405,9 +431,9 @@ def start_mlflow_run(
         mlflow.log_params(parameter_values)
     run_tags = {
         "voiceink.run_kind": run_kind,
-        "voiceink.mlflow_experience": (
-            "model-training" if run_kind.startswith("training.") else "genai"
-        ),
+        "voiceink.domain": run_domain(run_kind),
+        "voiceink.stage": run_kind.split(".", 1)[1] if "." in run_kind else run_kind,
+        "voiceink.mlflow_experience": mlflow_experience(run_kind),
         "voiceink.raw_data_logged": "false",
         "voiceink.tracing_enabled": "false",
         "voiceink.system_metrics_enabled": str(log_system_metrics).lower(),

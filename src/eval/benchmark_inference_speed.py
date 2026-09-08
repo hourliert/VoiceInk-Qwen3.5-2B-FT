@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--output", type=Path)
-    add_mlflow_args(parser, default_experiment="voiceink-benchmarks")
+    add_mlflow_args(parser, default_experiment="voiceink-evaluation")
     return parser.parse_args()
 
 
@@ -183,7 +183,7 @@ def main() -> None:
             "temperature": args.temperature,
             "sample_indices": indices,
         },
-        datasets=[dataset_metadata("speed_benchmark_eval", args.eval_data, len(samples))],
+        datasets=[dataset_metadata("evaluation", args.eval_data, len(samples))],
         tags={
             "voiceink.baseline_model": args.baseline_model,
             "voiceink.candidate_model": args.candidate_model,
@@ -248,6 +248,26 @@ def main() -> None:
         "baseline": summaries["baseline"],
         "candidate": summaries["candidate"],
         "candidate_speed_ratio": ratio,
+    })
+    model_ids = {}
+    for role in ("baseline", "candidate"):
+        endpoint = endpoints[role]
+        model_ids[role] = tracking.log_external_model(
+            name=endpoint["model"],
+            model_type="voiceink-transcript-cleanup",
+            params={
+                "comparison_role": role,
+                "endpoint": f"{endpoint['host']}:{endpoint['port']}",
+                "temperature": args.temperature,
+                "max_tokens": args.max_tokens,
+            },
+            tags={"voiceink.comparison_role": role},
+            metrics={"samples": args.samples, "latency": summaries[role]},
+            dataset_role="evaluation",
+        )
+    tracking.set_tags({
+        f"voiceink.{role}_logged_model_id": model_id
+        for role, model_id in model_ids.items() if model_id
     })
 
     if args.output:

@@ -46,7 +46,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--check-only", action="store_true")
-    add_mlflow_args(parser, default_experiment="voiceink-evaluation")
+    add_mlflow_args(parser, default_experiment="voiceink-data")
     return parser.parse_args(argv)
 
 
@@ -125,7 +125,7 @@ def main(argv=None) -> None:
     tracking = start_mlflow_run(
         args,
         run_name="qwen35-2b-v3-dpo-rejection-generation",
-        run_kind="evaluation.preference_generation.qwen",
+        run_kind="data.preference_generation.qwen",
         params={
             "model": args.model,
             "temperature": args.temperature,

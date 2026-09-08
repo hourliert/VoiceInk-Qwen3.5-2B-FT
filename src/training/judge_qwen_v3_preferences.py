@@ -44,7 +44,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--seed", type=int, default=3407)
     add_provider_args(parser, prefix="judge", default_provider="codex")
-    add_mlflow_args(parser, default_experiment="voiceink-evaluation")
+    add_mlflow_args(parser, default_experiment="voiceink-labeling")
     return parser.parse_args(argv)
 
 
@@ -146,7 +146,7 @@ def main(argv=None) -> None:
     tracking = start_mlflow_run(
         args,
         run_name="qwen35-2b-v3-dpo-preference-judgment",
-        run_kind="evaluation.preference_judgment.qwen",
+        run_kind="labeling.preference_judgment.qwen",
         params={
             "judge_provider": args.judge_provider,
             "judge_model": model,

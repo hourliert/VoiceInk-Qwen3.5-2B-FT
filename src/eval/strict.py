@@ -173,6 +173,10 @@ def run(args: argparse.Namespace) -> dict:
               "--judge-reasoning-effort", args.judge_reasoning_effort,
               "--parallel", str(args.parallel), "--llama-host", args.llama_host,
               "--llama-port", str(args.llama_port)]
+    if tracking.run_id:
+        common.extend(["--mlflow-parent-run-id", tracking.run_id])
+    else:
+        common.append("--no-mlflow")
     try:
         subprocess.run([sys.executable, str(ROOT / "src/eval/evaluate.py"), *common,
                         "--eval-data", str(regression_data), "--judge-rubric", "strict-v2",

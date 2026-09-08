@@ -8,8 +8,10 @@ from src.common.mlflow_tracking import (
     dataset_metadata,
     mlflow_model_name,
     numeric_metrics,
+    mlflow_experience,
     output_reference,
     resumed_param_updates,
+    run_domain,
     start_mlflow_run,
 )
 
@@ -26,6 +28,14 @@ class MlflowTrackingTests(unittest.TestCase):
         self.assertFalse(disabled.mlflow_enabled)
         self.assertEqual(enabled.mlflow_experiment, "voiceink-test")
         self.assertIsNone(enabled.mlflow_run_id)
+        self.assertIsNone(enabled.mlflow_parent_run_id)
+
+    def test_run_taxonomy_maps_to_mlflow_experiences(self) -> None:
+        self.assertEqual(run_domain("data.release"), "data")
+        self.assertEqual(run_domain("labeling.live_review"), "labeling")
+        self.assertEqual(mlflow_experience("training.sft.qwen"), "model-training")
+        self.assertEqual(mlflow_experience("data.release"), "model-training")
+        self.assertEqual(mlflow_experience("evaluation.quality"), "genai")
 
     def test_private_dataset_metadata_has_fingerprint_not_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -61,7 +61,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--max-edit-fraction", type=float, default=0.50)
     parser.add_argument("--eval-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=3407)
-    add_mlflow_args(parser, default_experiment="voiceink-training")
+    add_mlflow_args(parser, default_experiment="voiceink-data")
     return parser.parse_args(argv)
 
 

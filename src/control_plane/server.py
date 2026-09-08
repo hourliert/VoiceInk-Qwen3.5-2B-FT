@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -18,7 +19,9 @@ ROOT = Path(__file__).resolve().parents[2]
 STATIC_ROOT = ROOT / "src" / "control_plane" / "static"
 sys.path.insert(0, str(ROOT / "src"))
 
-from common.mlflow_tracking import add_mlflow_args  # noqa: E402
+from common.mlflow_tracking import (  # noqa: E402
+    add_mlflow_args, dataset_metadata, start_mlflow_run,
+)
 from control_plane.contracts import DecisionResponse, HealthResponse, ReadinessResponse  # noqa: E402
 from control_plane.ingest import ProxyLogIngester  # noqa: E402
 from control_plane.maintenance import MaintenanceWorker  # noqa: E402
@@ -50,6 +53,47 @@ PAGE_PATHS = {
     "/data/cohorts", "/data/releases", "/models", "/runs/training",
     "/runs/evaluations", "/system", "/system/docs",
 }
+
+
+def track_dataset_release(args: argparse.Namespace, release: dict) -> None:
+    """Register a sealed release as a reproducible MLflow data run."""
+    manifest_path = Path(release["manifest_path"])
+    release_root = manifest_path.parent
+    datasets = [
+        dataset_metadata(split, release_root / metadata["path"], metadata["records"])
+        for split, metadata in release["splits"].items()
+    ]
+    tracking_args = SimpleNamespace(
+        mlflow_enabled=args.mlflow_enabled,
+        mlflow_tracking_uri=args.mlflow_tracking_uri,
+        mlflow_experiment="voiceink-data",
+        mlflow_run_name=None,
+        mlflow_run_id=None,
+        mlflow_parent_run_id=None,
+    )
+    tracking = start_mlflow_run(
+        tracking_args,
+        run_name=f"dataset-release-{release['name']}",
+        run_kind="data.release",
+        params={
+            "release": release["name"],
+            "cohort": release["cohort"],
+            "records": release["records"],
+            "content_sha256": release["content_sha256"],
+            "manifest_path": manifest_path,
+        },
+        datasets=datasets,
+        tags={
+            "voiceink.dataset_release": release["name"],
+            "voiceink.dataset_release_sha256": release["content_sha256"],
+        },
+    )
+    tracking.log_metrics({
+        "records": release["records"],
+        "splits": {name: item["records"] for name, item in release["splits"].items()},
+    })
+    tracking.log_artifact(manifest_path, artifact_path="lineage/dataset-release")
+    tracking.finish()
 
 
 class ControlPlaneWorker(AnalysisWorker):
@@ -276,6 +320,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                     correction_cutoff=body.get("correction_cutoff"),
                     selection_sha256=body.get("selection_sha256"),
                 )
+                track_dataset_release(self.server.args, result)
                 self.server.reader._cohort_cache.pop(name, None)
                 self._json(result, 201)
             elif path.startswith("/api/samples/"):
