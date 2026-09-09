@@ -21,6 +21,11 @@ DEFAULT_PROFILES = ROOT / "config" / "training_profiles.toml"
 SAFE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+def should_load_best_model(trainer_args: list[str]) -> bool:
+    """Best-checkpoint loading is invalid when a smoke run disables eval."""
+    return "--skip-eval" not in trainer_args
+
+
 def load_profile(path: Path, name: str) -> dict:
     profiles = tomllib.loads(path.read_text(encoding="utf-8")).get("profiles", {})
     if name not in profiles:
@@ -72,8 +77,9 @@ def resolved_command(args: argparse.Namespace) -> tuple[list[str], dict]:
                    "--eval-batch-size", str(profile["eval_batch_size"]),
                    "--warmup-steps", str(profile["warmup_steps"]),
                    "--eval-steps", str(profile["eval_steps"]),
-                   "--save-steps", str(profile["save_steps"]),
-                   "--load-best-model-at-end"]
+                   "--save-steps", str(profile["save_steps"])]
+        if should_load_best_model(args.trainer_arg):
+            command.append("--load-best-model-at-end")
     else:
         if manifest.get("task") != "preference":
             raise ValueError("DPO requires a sealed preference release manifest")

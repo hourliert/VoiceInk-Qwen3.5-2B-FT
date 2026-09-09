@@ -18,6 +18,7 @@ from data.schema import migrate
 from data.seal_preference import seal
 from eval.strict import verify_pair
 from labeling.annotation_store import AnnotationStore
+from training.train import should_load_best_model
 
 
 def sample(index, kind):
@@ -235,6 +236,10 @@ class CanonicalPipelineTests(unittest.TestCase):
             updated = config.read_text()
             self.assertIn("models/legacy/Qwen3.5-2B-VoiceInk-v3-DPO-v1_gguf", updated)
             self.assertNotIn("models/canonical/Qwen3.5-2B-VoiceInk-v3-DPO", updated)
+
+    def test_smoke_training_disables_best_checkpoint_loading(self):
+        self.assertFalse(should_load_best_model(["--max-steps", "2", "--skip-eval"]))
+        self.assertTrue(should_load_best_model(["--max-steps", "2"]))
 
     def test_training_profiles_write_only_to_canonical_namespaces(self):
         profiles = tomllib.loads(
